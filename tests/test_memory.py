@@ -2347,6 +2347,44 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertTrue(results)
         self.assertIn("Linux box", results[0].memory.content)
 
+    def test_handoff_restore_manager_does_not_require_memory_store(self) -> None:
+        source_workspace = self._make_workspace()
+        source_agent_dir = source_workspace / ".agent"
+        source_agent_dir.mkdir(parents=True, exist_ok=True)
+        export_db = source_agent_dir / "agent_memory.sqlite3"
+        export_store = MemoryStore(export_db)
+        try:
+            export_store.remember(
+                MemoryDraft(
+                    kind="constraint",
+                    subject="runtime",
+                    content="The agent should restore without opening sqlite first.",
+                )
+            )
+            bundle_report = ProjectHandoffManager(
+                export_store,
+                workspace_root=source_workspace,
+            ).create_bundle(include_traces=False)
+        finally:
+            export_store.close()
+
+        target_workspace = self._make_workspace()
+        (target_workspace / "pyproject.toml").write_text(
+            "[project]\nname = \"target\"\nversion = \"0.0.1\"\n",
+            encoding="utf-8",
+        )
+        restore_report = ProjectHandoffManager(
+            workspace_root=target_workspace,
+        ).restore_bundle(Path(bundle_report.bundle_path))
+
+        self.assertIn(".agent/agent_memory.sqlite3", restore_report.restored_files)
+        restored_store = MemoryStore(target_workspace / ".agent" / "agent_memory.sqlite3")
+        try:
+            results = restored_store.search("restore without opening sqlite", limit=3)
+        finally:
+            restored_store.close()
+        self.assertTrue(results)
+
     def test_patch_run_args_accept_utf8_bom_spec_file(self) -> None:
         spec_path = self.temp_root / f"{uuid.uuid4().hex}_patch_spec.json"
         self.extra_paths.append(spec_path)

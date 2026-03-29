@@ -52,7 +52,7 @@ class HandoffRestoreReport:
 class ProjectHandoffManager:
     def __init__(
         self,
-        memory_store,
+        memory_store=None,
         *,
         workspace_root: Path | None = None,
         handoffs_root: Path | None = None,
@@ -73,6 +73,8 @@ class ProjectHandoffManager:
         output_dir: Path | None = None,
         include_traces: bool = True,
     ) -> HandoffBundleReport:
+        if self.memory_store is None:
+            raise RuntimeError("create_bundle requires an attached memory store.")
         created_at = utc_now_iso()
         stamp = self._timestamp_token(created_at)
         destination = (

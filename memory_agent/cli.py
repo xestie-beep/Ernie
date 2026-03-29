@@ -353,6 +353,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "handoff-restore":
+        manager = ProjectHandoffManager(workspace_root=Path.cwd())
+        report = manager.restore_bundle(
+            args.bundle_path,
+            target_root=args.target_root,
+            force=args.force,
+        )
+        if args.json:
+            print(json.dumps(_handoff_restore_to_json(report), indent=2))
+        else:
+            print(report.render())
+        return 0
     store = MemoryStore(args.db)
     try:
         if args.command == "observe":
@@ -812,19 +824,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.json:
                 print(json.dumps(_handoff_bundle_to_json(report), indent=2))
-            else:
-                print(report.render())
-            return 0
-
-        if args.command == "handoff-restore":
-            manager = ProjectHandoffManager(store, workspace_root=Path.cwd())
-            report = manager.restore_bundle(
-                args.bundle_path,
-                target_root=args.target_root,
-                force=args.force,
-            )
-            if args.json:
-                print(json.dumps(_handoff_restore_to_json(report), indent=2))
             else:
                 print(report.render())
             return 0
