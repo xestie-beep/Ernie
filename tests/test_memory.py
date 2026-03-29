@@ -1,0 +1,3387 @@
+from __future__ import annotations
+
+import json
+import shutil
+import unittest
+import uuid
+import zipfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import subprocess
+from argparse import Namespace
+
+import memory_agent.cli as cli_module
+from memory_agent.agent import MemoryFirstAgent
+from memory_agent.cli import _resolve_patch_run_args, _run_pilot_chat
+from memory_agent.evaluation import (
+    EvalCheckResult,
+    EvalScenarioResult,
+    EvalSuiteResult,
+    MemoryEvaluator,
+)
+from memory_agent.executor import MemoryExecutor
+from memory_agent.file_adapter import WorkspaceFileAdapter
+from memory_agent.improvement import MemoryImprovementEngine, PilotHistoryReporter, PilotRunReviewer
+from memory_agent.linux_runtime import LinuxPilotPolicy, LinuxPilotRuntime
+from memory_agent.memory import MemoryStore
+from memory_agent.migration import ProjectHandoffManager
+from memory_agent.model_adapter import BaseModelAdapter, ModelMessage, ModelResponse, OllamaChatAdapter
+from memory_agent.models import MemoryDraft
+from memory_agent.patch_runner import PatchOperation, WorkspacePatchRunner
+from memory_agent.planner import MemoryPlanner
+from memory_agent.reranker import OptionalSemanticReranker
+from memory_agent.shell_adapter import GuardedShellAdapter
+
+
+class MemoryStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_root = Path.cwd() / ".test_tmp"
+        self.temp_root.mkdir(exist_ok=True)
+        self.db_path = self.temp_root / f"{uuid.uuid4().hex}.sqlite3"
+        self.extra_paths: list[Path] = []
+        self.extra_dirs: list[Path] = []
+        self.store = MemoryStore(self.db_path)
+
+    def tearDown(self) -> None:
+        self.store.close()
+        for candidate in self.extra_paths:
+            if candidate.exists():
+                candidate.unlink()
+        for candidate in reversed(self.extra_dirs):
+            if candidate.exists():
+                shutil.rmtree(candidate)
+        for candidate in (
+            self.db_path,
+            Path(f"{self.db_path}-wal"),
+            Path(f"{self.db_path}-shm"),
+        ):
+            if candidate.exists():
+                candidate.unlink()
+
+    def _record_green_baseline(self, *, score: float = 1.0) -> None:
+        report = EvalSuiteResult(
+            passed=score >= 1.0,
+            score=score,
+            scenario_results=[
+                EvalScenarioResult(
+                    name="baseline",
+                    description="Baseline evaluation.",
+                    passed=score >= 1.0,
+                    score=score,
+                    checks=[
+                        EvalCheckResult(
+                            name="baseline-check",
+                            passed=score >= 1.0,
+                            details="Baseline is available.",
+                        )
+                    ],
+                )
+            ],
+        )
+        self.store.record_evaluation_run("builtin", report)
+
+    def _make_workspace(self) -> Path:
+        workspace = self.temp_root / f"workspace_{uuid.uuid4().hex}"
+        workspace.mkdir(parents=True, exist_ok=True)
+        self.extra_dirs.append(workspace)
+        return workspace
+
+    def _fake_patch_shell_runner(self, argv, cwd, capture_output, text, timeout, shell):
+        command_text = " ".join(str(part) for part in argv)
+        if "evaluate" in command_text and "--json" in command_text:
+            payload = {
+                "passed": True,
+                "score": 1.0,
+                "scenario_results": [
+                    {
+                        "name": "preview",
+                        "description": "preview validation",
+                        "passed": True,
+                        "score": 1.0,
+                        "checks": [
+                            {
+                                "name": "preview-check",
+                                "passed": True,
+                                "details": "ok",
+                            }
+                        ],
+                    }
+                ],
+            }
+            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+        return subprocess.CompletedProcess(argv, 0, "ok\n", "")
+
+    def _make_runtime_patch_runner(
+        self,
+        *,
+        workspace_root: Path | None = None,
+    ) -> WorkspacePatchRunner:
+        return WorkspacePatchRunner(
+            self.store,
+            workspace_root=workspace_root or Path.cwd(),
+            shell_runner=self._fake_patch_shell_runner,
+        )
+
+    def test_observe_extracts_local_runtime_and_priority(self) -> None:
+        _, stored = self.store.observe(
+            role="user",
+            content=(
+                "Lets make an agent from scratch. It should run locally on my main pc. "
+                "My priority is implementing the memory system first."
+            ),
+        )
+        contents = {item.content for item in stored}
+        self.assertIn("Build the agent from scratch.", contents)
+        self.assertIn("The agent should run locally on the user's main PC.", contents)
+        self.assertIn("Implement the memory system first.", contents)
+
+    def test_observe_extracts_tasks_and_decisions(self) -> None:
+        _, stored = self.store.observe(
+            role="user",
+            content=(
+                "Next step: add contradiction handling. "
+                "Decision: use SQLite as the source of truth for memory storage."
+            ),
+        )
+        kinds = {(item.kind, item.subject) for item in stored}
+        self.assertIn(("task", "execution"), kinds)
+        self.assertIn(("decision", "storage"), kinds)
+
+    def test_assistant_observe_extracts_tool_outcome(self) -> None:
+        _, stored = self.store.observe(
+            role="assistant",
+            content="Implemented local semantic reranking and tests passed.",
+        )
+        self.assertTrue(any(item.kind == "tool_outcome" for item in stored))
+
+    def test_search_returns_relevant_memory(self) -> None:
+        self.store.remember(
+            MemoryDraft(
+                kind="constraint",
+                subject="runtime",
+                content="The agent should run locally on the user's main PC.",
+                tags=["runtime", "local"],
+                importance=0.95,
+                confidence=0.95,
+            )
+        )
+        results = self.store.search("local main pc", limit=3)
+        self.assertGreaterEqual(len(results), 1)
+        self.assertEqual(
+            results[0].memory.content,
+            "The agent should run locally on the user's main PC.",
+        )
+
+    def test_entity_aliases_bridge_database_and_retrieval_queries(self) -> None:
+        self.store.observe(
+            role="user",
+            content="My priority is implementing the memory system first.",
+        )
+        sqlite_decision = self.store.record_decision(
+            "storage",
+            "Use SQLite as the source of truth for memory storage",
+        )
+        database_results = self.store.search("database choice", limit=3)
+        self.assertGreaterEqual(len(database_results), 1)
+        self.assertEqual(database_results[0].memory.id, sqlite_decision.id)
+        self.assertTrue(
+            any(reason.startswith("entities=") for reason in database_results[0].reasons)
+        )
+
+        retrieval_results = self.store.search("retrieval stack", limit=3)
+        self.assertGreaterEqual(len(retrieval_results), 1)
+        self.assertIn("memory system first", retrieval_results[0].memory.content.lower())
+        resolved = self.store.resolve_entities("database choice for the retrieval stack")
+        canonical_names = {entity.canonical_name for entity in resolved}
+        self.assertIn("sqlite", canonical_names)
+        self.assertIn("memory_system", canonical_names)
+
+    def test_context_includes_recent_events(self) -> None:
+        self.store.observe(role="user", content="We are building from scratch.")
+        self.store.observe(role="user", content="Please optimize for low ongoing cost.")
+        self.store.remember(
+            MemoryDraft(
+                kind="preference",
+                subject="optimization",
+                content="Optimize the agent for efficient, low-latency operation.",
+                tags=["performance", "optimization"],
+                importance=0.92,
+                confidence=0.9,
+            )
+        )
+        self.store.consolidate_recent()
+        context = self.store.build_context("cost", memory_limit=3, recent_event_count=2)
+        self.assertEqual(len(context.recent_events), 2)
+        self.assertIn("Please optimize for low ongoing cost.", context.render())
+        self.assertTrue(any(profile.memory.layer == "profile" for profile in context.profiles))
+        self.assertTrue(any(bundle.evidence for bundle in context.bundles))
+
+    def test_task_updates_supersede_previous_versions_and_resurface_open_loops(self) -> None:
+        original = self.store.record_task(
+            "Ship the memory benchmark harness",
+            status="open",
+            area="execution",
+        )
+        current = self.store.record_task(
+            "Ship the memory benchmark harness",
+            status="in_progress",
+            area="execution",
+        )
+        done = self.store.record_task(
+            "Archive outdated benchmark fixtures",
+            status="done",
+            area="execution",
+        )
+        original_after = self.store.get_memory(original.id)
+        self.assertIsNotNone(original_after.archived_at)
+        edges = self.store.get_memory_edges(current.id, direction="outgoing")
+        self.assertTrue(
+            any(edge.edge_type == "supersedes" and edge.to_memory_id == original.id for edge in edges)
+        )
+        open_tasks = self.store.get_open_tasks(limit=5)
+        titles = [str(task.metadata.get("title")) for task in open_tasks]
+        self.assertIn("Ship the memory benchmark harness", titles)
+        self.assertNotIn("Archive outdated benchmark fixtures", titles)
+        context = self.store.build_context("execution tasks", memory_limit=5, recent_event_count=1)
+        context_titles = [str(task.metadata.get("title")) for task in context.open_tasks]
+        self.assertIn("Ship the memory benchmark harness", context_titles)
+        self.assertNotIn("Archive outdated benchmark fixtures", context_titles)
+
+    def test_task_dependencies_blockers_and_due_dates_persist_across_updates(self) -> None:
+        prerequisite = self.store.record_task(
+            "Finish entity resolution",
+            status="in_progress",
+            area="execution",
+            due_date="2026-04-01",
+        )
+        blocked = self.store.record_task(
+            "Build task graph maintenance",
+            status="blocked",
+            area="execution",
+            depends_on=["Finish entity resolution"],
+            blocked_by=["Finish entity resolution"],
+            due_date="2026-04-02",
+        )
+        blocked_current = self.store.record_task(
+            "Build task graph maintenance",
+            status="in_progress",
+            area="execution",
+        )
+        self.assertEqual(blocked_current.metadata.get("due_date"), "2026-04-02")
+        self.assertEqual(
+            blocked_current.metadata.get("depends_on"),
+            ["Finish entity resolution"],
+        )
+        self.assertEqual(
+            blocked_current.metadata.get("blocked_by"),
+            ["Finish entity resolution"],
+        )
+        context = self.store.build_context("blocked execution tasks", memory_limit=5, recent_event_count=1)
+        surfaced = next(
+            task for task in context.open_tasks if task.id == blocked_current.id
+        )
+        self.assertEqual(surfaced.metadata.get("due_date"), "2026-04-02")
+        task_entity = next(
+            link.entity
+            for link in self.store.get_memory_entities(blocked_current.id)
+            if link.entity.entity_type == "task"
+        )
+        prerequisite_entity = next(
+            link.entity
+            for link in self.store.get_memory_entities(prerequisite.id)
+            if link.entity.entity_type == "task"
+        )
+        entity_edges = self.store.get_entity_edges(task_entity.id, direction="outgoing")
+        self.assertTrue(
+            any(
+                edge.edge_type == "depends_on" and edge.to_entity_id == prerequisite_entity.id
+                for edge in entity_edges
+            )
+        )
+        self.assertTrue(
+            any(
+                edge.edge_type == "blocked_by" and edge.to_entity_id == prerequisite_entity.id
+                for edge in entity_edges
+            )
+        )
+
+    def test_ready_and_overdue_task_views_prioritize_actionable_work(self) -> None:
+        overdue_ready = self.store.record_task(
+            "Ship overdue ready memory loop",
+            status="open",
+            area="execution",
+            due_date="2000-01-01",
+        )
+        future_ready = self.store.record_task(
+            "Ship future ready memory loop",
+            status="in_progress",
+            area="execution",
+            due_date="2999-01-01",
+        )
+        blocked_overdue = self.store.record_task(
+            "Blocked on external API approval",
+            status="blocked",
+            area="execution",
+            blocked_by=["Vendor approval"],
+            due_date="2000-01-01",
+        )
+        ready_tasks = self.store.get_ready_tasks(limit=5)
+        ready_titles = [str(task.metadata.get("title")) for task in ready_tasks]
+        self.assertEqual(ready_titles[0], "Ship overdue ready memory loop")
+        self.assertIn("Ship future ready memory loop", ready_titles)
+        self.assertNotIn("Blocked on external API approval", ready_titles)
+
+        overdue_tasks = self.store.get_overdue_tasks(limit=5)
+        overdue_titles = [str(task.metadata.get("title")) for task in overdue_tasks]
+        self.assertIn("Ship overdue ready memory loop", overdue_titles)
+        self.assertIn("Blocked on external API approval", overdue_titles)
+
+        open_tasks = self.store.get_open_tasks(limit=5)
+        open_titles = [str(task.metadata.get("title")) for task in open_tasks]
+        self.assertLess(
+            open_titles.index("Ship future ready memory loop"),
+            open_titles.index("Blocked on external API approval"),
+        )
+
+        context = self.store.build_context("ready overdue execution work", memory_limit=5, recent_event_count=1)
+        ready_context_titles = [str(task.metadata.get("title")) for task in context.ready_tasks]
+        overdue_context_titles = [str(task.metadata.get("title")) for task in context.overdue_tasks]
+        self.assertIn("Ship overdue ready memory loop", ready_context_titles)
+        self.assertIn("Ship future ready memory loop", ready_context_titles)
+        self.assertNotIn("Blocked on external API approval", ready_context_titles)
+        self.assertIn("Blocked on external API approval", overdue_context_titles)
+        rendered = context.render()
+        self.assertIn("Ready now:", rendered)
+        self.assertIn("Overdue:", rendered)
+        self.assertIn("overdue", rendered.lower())
+
+    def test_review_tasks_generates_nudges_for_overdue_and_stale_work(self) -> None:
+        overdue_ready = self.store.record_task(
+            "Ship overdue ready memory loop",
+            status="open",
+            area="execution",
+            due_date="2000-01-01",
+        )
+        stale_blocked = self.store.record_task(
+            "Unblock vendor approval",
+            status="blocked",
+            area="execution",
+            blocked_by=["Vendor approval"],
+            due_date="2999-01-01",
+        )
+        backdated = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+        self.store.connection.execute(
+            "update memories set updated_at = ? where id = ?",
+            (backdated, stale_blocked.id),
+        )
+        self.store.connection.commit()
+
+        nudges = self.store.review_tasks(limit=5)
+        self.assertEqual(len(nudges), 2)
+        nudge_contents = [nudge.content for nudge in nudges]
+        self.assertTrue(any("overdue and ready to work on now" in content for content in nudge_contents))
+        self.assertTrue(any("has been blocked for" in content for content in nudge_contents))
+        self.assertTrue(all(nudge.kind == "nudge" for nudge in nudges))
+
+        search_results = self.store.search("overdue nudge", limit=5)
+        self.assertTrue(any(result.memory.kind == "nudge" for result in search_results))
+
+        overdue_nudge = next(
+            nudge for nudge in nudges if "Ship overdue ready memory loop" in nudge.content
+        )
+        edges = self.store.get_memory_edges(overdue_nudge.id, direction="outgoing")
+        self.assertTrue(
+            any(edge.edge_type == "nudges" and edge.to_memory_id == overdue_ready.id for edge in edges)
+        )
+
+        second_pass = self.store.review_tasks(limit=5)
+        self.assertEqual(second_pass, [])
+
+    def test_recurring_tasks_roll_forward_and_respect_snooze_resume(self) -> None:
+        recurring = self.store.record_task(
+            "Weekly memory audit",
+            status="open",
+            area="execution",
+            due_date="2026-04-01",
+            recurrence_days=7,
+        )
+        completion = self.store.complete_task("Weekly memory audit", area="execution")
+        completed = completion["completed"]
+        next_occurrence = completion["next_occurrence"]
+        self.assertIsNotNone(completed)
+        self.assertIsNotNone(next_occurrence)
+        self.assertEqual(next_occurrence.metadata.get("due_date"), "2026-04-08")
+        self.assertEqual(next_occurrence.metadata.get("recurrence_days"), 7)
+        recurrence_edges = self.store.get_memory_edges(completed.id, direction="outgoing")
+        self.assertTrue(
+            any(edge.edge_type == "recurs_to" and edge.to_memory_id == next_occurrence.id for edge in recurrence_edges)
+        )
+
+        snoozed = self.store.snooze_task(
+            "Weekly memory audit",
+            until="2999-01-01",
+            area="execution",
+        )
+        self.assertEqual(snoozed.metadata.get("snoozed_until"), "2999-01-01")
+        ready_titles = [str(task.metadata.get("title")) for task in self.store.get_ready_tasks(limit=5)]
+        self.assertNotIn("Weekly memory audit", ready_titles)
+
+        resumed = self.store.resume_task("Weekly memory audit", area="execution")
+        self.assertIsNone(resumed.metadata.get("snoozed_until"))
+        ready_titles = [str(task.metadata.get("title")) for task in self.store.get_ready_tasks(limit=5)]
+        self.assertIn("Weekly memory audit", ready_titles)
+
+    def test_unblock_task_clears_blockers_and_enables_ready_state(self) -> None:
+        blocked = self.store.record_task(
+            "Finalize vendor migration",
+            status="blocked",
+            area="execution",
+            blocked_by=["Vendor approval"],
+        )
+        unblocked = self.store.unblock_task("Finalize vendor migration", area="execution")
+        self.assertEqual(unblocked.metadata.get("blocked_by"), [])
+        self.assertEqual(unblocked.metadata.get("status"), "open")
+        ready_titles = [str(task.metadata.get("title")) for task in self.store.get_ready_tasks(limit=5)]
+        self.assertIn("Finalize vendor migration", ready_titles)
+
+    def test_review_tasks_escalates_after_repeated_nudges(self) -> None:
+        blocked = self.store.record_task(
+            "Escalate vendor access",
+            status="blocked",
+            area="execution",
+            blocked_by=["Vendor approval"],
+            due_date="2000-01-01",
+        )
+        first_nudges = self.store.review_tasks(limit=5)
+        self.assertTrue(any("Escalate vendor access" in nudge.content for nudge in first_nudges))
+        first_nudge = next(nudge for nudge in first_nudges if "Escalate vendor access" in nudge.content)
+        backdated = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        self.store.connection.execute(
+            "update memories set updated_at = ? where id = ?",
+            (backdated, first_nudge.id),
+        )
+        self.store.connection.commit()
+
+        second_nudges = self.store.review_tasks(limit=5)
+        self.assertEqual(len(second_nudges), 1)
+        self.assertIn("Escalation:", second_nudges[0].content)
+        self.assertIn("Escalate vendor access", second_nudges[0].content)
+
+    def test_planner_prioritizes_escalated_blockers_over_ready_work(self) -> None:
+        self.store.record_task(
+            "Ship overdue ready memory loop",
+            status="open",
+            area="execution",
+            due_date="2000-01-01",
+        )
+        self.store.record_task(
+            "Escalate vendor access",
+            status="blocked",
+            area="execution",
+            blocked_by=["Vendor approval"],
+            due_date="2000-01-01",
+        )
+        first_nudges = self.store.review_tasks(limit=5)
+        first_nudge = next(nudge for nudge in first_nudges if "Escalate vendor access" in nudge.content)
+        backdated = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        self.store.connection.execute(
+            "update memories set updated_at = ? where id = ?",
+            (backdated, first_nudge.id),
+        )
+        self.store.connection.commit()
+        self.store.review_tasks(limit=5)
+
+        planner = MemoryPlanner(self.store)
+        snapshot = planner.build_plan("what should I do next", action_limit=3)
+        self.assertIsNotNone(snapshot.recommendation)
+        self.assertEqual(snapshot.recommendation.kind, "resolve_blocker")
+        self.assertEqual(snapshot.recommendation.title, "Escalate vendor access")
+        self.assertTrue(
+            any(reason == "nudge=escalation" for reason in snapshot.recommendation.reasons)
+        )
+        alternative_titles = [action.title for action in snapshot.alternatives]
+        self.assertIn("Ship overdue ready memory loop", alternative_titles)
+
+    def test_planner_recommends_maintenance_when_no_active_execution_exists(self) -> None:
+        self.store.remember(
+            MemoryDraft(
+                kind="preference",
+                subject="optimization",
+                content="Optimize the agent for low ongoing cost.",
+                tags=["cost", "optimization"],
+                importance=0.95,
+                confidence=0.9,
+            )
+        )
+        self.store.remember(
+            MemoryDraft(
+                kind="preference",
+                subject="optimization",
+                content="Optimize the agent for efficient, low-latency operation.",
+                tags=["performance", "optimization"],
+                importance=0.92,
+                confidence=0.9,
+            )
+        )
+
+        planner = MemoryPlanner(self.store)
+        snapshot = planner.build_plan("memory maintenance", action_limit=3)
+        self.assertIsNotNone(snapshot.recommendation)
+        self.assertEqual(snapshot.recommendation.kind, "run_maintenance")
+        self.assertIn("maintenance_due=", " ".join(snapshot.recommendation.reasons))
+
+    def test_planner_uses_pilot_history_to_prefer_safe_ready_work(self) -> None:
+        for index in range(2):
+            self.store.record_tool_outcome(
+                "pilot-review",
+                f"Pilot review {index} stopped on approval friction",
+                status="blocked",
+                subject="self_improvement",
+                tags=["pilot", "review", "self-improvement"],
+                metadata={
+                    "goal_text": f"pilot history seed {index}",
+                    "stop_reason": "needs_approval",
+                    "executed_steps": 0,
+                    "approval_requests": 1,
+                    "approvals_granted": 0,
+                    "opportunity_count": 1,
+                    "opportunity_categories": ["approval_friction"],
+                    "recurring_patterns": [],
+                },
+            )
+
+        self.store.record_task(
+            "Pilot safe read",
+            status="open",
+            area="execution",
+            file_operation="read_text",
+            file_path=".test_tmp/pilot_safe_read.txt",
+            complete_on_success=True,
+        )
+        self.store.record_task(
+            "Pilot risky write",
+            status="open",
+            area="execution",
+            file_operation="write_text",
+            file_path=".test_tmp/pilot_risky_write.txt",
+            file_text="updated\n",
+            complete_on_success=True,
+        )
+
+        planner = MemoryPlanner(self.store)
+        snapshot = planner.build_plan("what should I do next", action_limit=3)
+
+        self.assertIsNotNone(snapshot.recommendation)
+        self.assertEqual(snapshot.recommendation.title, "Pilot safe read")
+        self.assertEqual(snapshot.pilot_history.get("approval_friction_count"), 2)
+        self.assertTrue(
+            any(
+                reason.startswith("pilot_history_prefers_safe_execution")
+                for reason in snapshot.recommendation.reasons
+            )
+        )
+        risky = next(action for action in snapshot.alternatives if action.title == "Pilot risky write")
+        self.assertTrue(
+            any(
+                reason.startswith("pilot_history=approval_friction")
+                for reason in risky.reasons
+            )
+        )
+
+    def test_planner_can_propose_preparation_for_risky_ready_work(self) -> None:
+        for index in range(2):
+            self.store.record_tool_outcome(
+                "pilot-review",
+                f"Pilot review {index} stopped on approval friction",
+                status="blocked",
+                subject="self_improvement",
+                tags=["pilot", "review", "self-improvement"],
+                metadata={
+                    "goal_text": f"pilot history prep seed {index}",
+                    "stop_reason": "needs_approval",
+                    "executed_steps": 0,
+                    "approval_requests": 1,
+                    "approvals_granted": 0,
+                    "opportunity_count": 1,
+                    "opportunity_categories": ["approval_friction"],
+                    "recurring_patterns": [],
+                },
+            )
+
+        self.store.record_task(
+            "Pilot risky write",
+            status="open",
+            area="execution",
+            file_operation="write_text",
+            file_path=".test_tmp/pilot_risky_write.txt",
+            file_text="updated\n",
+            complete_on_success=True,
+        )
+
+        planner = MemoryPlanner(self.store)
+        snapshot = planner.build_plan("what should I do next", action_limit=3)
+
+        self.assertIsNotNone(snapshot.recommendation)
+        self.assertEqual(snapshot.recommendation.kind, "prepare_task")
+        self.assertEqual(
+            snapshot.recommendation.title,
+            "Prepare safer execution for Pilot risky write",
+        )
+        self.assertEqual(
+            snapshot.recommendation.metadata.get("target_task_title"),
+            "Pilot risky write",
+        )
+        self.assertTrue(
+            any(
+                reason.startswith("pilot_history=approval_friction")
+                for reason in snapshot.recommendation.reasons
+            )
+        )
+
+    def test_executor_starts_ready_task_and_logs_outcome(self) -> None:
+        self.store.record_task(
+            "Ship overdue ready memory loop",
+            status="open",
+            area="execution",
+            due_date="2000-01-01",
+        )
+        executor = MemoryExecutor(self.store)
+        cycle = executor.execute_next("what should I do next", action_limit=3)
+
+        self.assertEqual(cycle.result.executed_kind, "work_task")
+        self.assertEqual(cycle.result.status, "success")
+        self.assertEqual(cycle.result.task_update.metadata.get("status"), "in_progress")
+        self.assertIsNotNone(cycle.result.tool_outcome)
+        self.assertIn("Started task 'Ship overdue ready memory loop'", cycle.result.tool_outcome.content)
+
+    def test_executor_reroutes_blocked_task_to_ready_dependency(self) -> None:
+        self.store.record_task(
+            "Finish entity resolution",
+            status="open",
+            area="execution",
+        )
+        self.store.record_task(
+            "Build task graph maintenance",
+            status="blocked",
+            area="execution",
+            blocked_by=["Finish entity resolution"],
+            due_date="2000-01-01",
+        )
+
+        executor = MemoryExecutor(self.store)
+        cycle = executor.execute_next("what should I do next", action_limit=3)
+
+        self.assertEqual(cycle.result.executed_kind, "resolve_blocker")
+        self.assertEqual(cycle.result.status, "success")
+        self.assertIsNotNone(cycle.result.task_update)
+        self.assertEqual(cycle.result.task_update.metadata.get("title"), "Finish entity resolution")
+        self.assertEqual(cycle.result.task_update.metadata.get("status"), "in_progress")
+        self.assertIn("Finish entity resolution", cycle.result.summary)
+
+    def test_executor_prepares_safer_step_for_risky_task_after_pilot_friction(self) -> None:
+        for index in range(2):
+            self.store.record_tool_outcome(
+                "pilot-review",
+                f"Pilot review {index} stopped on approval friction",
+                status="blocked",
+                subject="self_improvement",
+                tags=["pilot", "review", "self-improvement"],
+                metadata={
+                    "goal_text": f"pilot history executor seed {index}",
+                    "stop_reason": "needs_approval",
+                    "executed_steps": 0,
+                    "approval_requests": 1,
+                    "approvals_granted": 0,
+                    "opportunity_count": 1,
+                    "opportunity_categories": ["approval_friction"],
+                    "recurring_patterns": [],
+                },
+            )
+
+        self.store.record_task(
+            "Pilot risky write",
+            status="open",
+            area="execution",
+            file_operation="write_text",
+            file_path=".test_tmp/pilot_risky_write_executor.txt",
+            file_text="updated\n",
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(self.store)
+        cycle = executor.execute_next("what should I do next", action_limit=3)
+
+        self.assertEqual(cycle.result.executed_kind, "prepare_task")
+        self.assertEqual(cycle.result.status, "success")
+        self.assertIsNotNone(cycle.result.related_task)
+        self.assertEqual(
+            cycle.result.related_task.metadata.get("title"),
+            "Prepare safer execution for Pilot risky write",
+        )
+        self.assertEqual(cycle.result.related_task.metadata.get("status"), "open")
+        self.assertEqual(cycle.result.task_update.metadata.get("status"), "blocked")
+        self.assertIn(
+            "Prepare safer execution for Pilot risky write",
+            cycle.result.task_update.metadata.get("blocked_by", []),
+        )
+        self.assertIsNotNone(cycle.after_plan.recommendation)
+        self.assertEqual(cycle.after_plan.recommendation.kind, "work_task")
+        self.assertEqual(
+            cycle.after_plan.recommendation.title,
+            "Prepare safer execution for Pilot risky write",
+        )
+
+    def test_agent_execute_next_replans_after_running_executor(self) -> None:
+        self.store.record_task(
+            "Ship overdue ready memory loop",
+            status="open",
+            area="execution",
+            due_date="2000-01-01",
+        )
+        agent = MemoryFirstAgent(self.store)
+
+        cycle = agent.execute_next("what should I do next", action_limit=3)
+
+        self.assertEqual(cycle.before_plan.recommendation.title, "Ship overdue ready memory loop")
+        self.assertEqual(cycle.result.executed_kind, "work_task")
+        self.assertIsNotNone(cycle.after_plan.recommendation)
+        self.assertEqual(cycle.after_plan.recommendation.title, "Ship overdue ready memory loop")
+
+    def test_executor_runs_safe_shell_command_and_completes_task(self) -> None:
+        self.store.record_task(
+            "Check CLI help",
+            status="open",
+            area="execution",
+            command="python -m memory_agent.cli --help",
+            complete_on_success=True,
+        )
+
+        def fake_runner(argv, cwd, capture_output, text, timeout, shell):
+            self.assertEqual(argv[:3], ["python", "-m", "memory_agent.cli"])
+            self.assertFalse(shell)
+            return subprocess.CompletedProcess(argv, 0, "usage: cli.py\n", "")
+
+        executor = MemoryExecutor(
+            self.store,
+            shell_adapter=GuardedShellAdapter(
+                workspace_root=Path.cwd(),
+                runner=fake_runner,
+            ),
+        )
+        cycle = executor.execute_next("check cli help", action_limit=3)
+
+        self.assertEqual(cycle.result.executed_kind, "run_shell")
+        self.assertEqual(cycle.result.status, "success")
+        self.assertIsNotNone(cycle.result.shell_result)
+        self.assertEqual(cycle.result.task_update.metadata.get("status"), "done")
+        self.assertIn("Ran shell command for 'Check CLI help'", cycle.result.tool_outcome.content)
+        open_titles = [str(task.metadata.get("title")) for task in self.store.get_open_tasks(limit=5)]
+        self.assertNotIn("Check CLI help", open_titles)
+
+    def test_shell_adapter_blocks_disallowed_command_prefix(self) -> None:
+        self.store.record_task(
+            "Run arbitrary python one-liner",
+            status="open",
+            area="execution",
+            command="python -c print('hi')",
+        )
+        executor = MemoryExecutor(self.store)
+        cycle = executor.execute_next("run arbitrary python one-liner", action_limit=3)
+
+        self.assertEqual(cycle.result.executed_kind, "run_shell")
+        self.assertEqual(cycle.result.status, "blocked")
+        self.assertIsNotNone(cycle.result.shell_result)
+        self.assertEqual(cycle.result.shell_result.reason, "command_prefix_not_allowed")
+        self.assertIn("blocked by shell policy", cycle.result.summary.lower())
+
+    def test_executor_runs_workspace_file_replace_and_completes_task(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}.txt"
+        self.extra_paths.append(target)
+        target.write_text("alpha\nbeta\n", encoding="utf-8")
+        self.store.record_task(
+            "Update local fixture",
+            status="open",
+            area="execution",
+            file_operation="replace_text",
+            file_path=str(target.relative_to(Path.cwd())),
+            find_text="beta",
+            file_text="gamma",
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("update local fixture", action_limit=3)
+
+        self.assertEqual(cycle.result.executed_kind, "run_file_operation")
+        self.assertEqual(cycle.result.status, "success")
+        self.assertIsNotNone(cycle.result.file_result)
+        self.assertEqual(cycle.result.task_update.metadata.get("status"), "done")
+        self.assertEqual(target.read_text(encoding="utf-8"), "alpha\ngamma\n")
+        self.assertIn("Ran file operation for 'Update local fixture'", cycle.result.tool_outcome.content)
+
+    def test_linux_pilot_runtime_requires_approval_for_file_write_tasks(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}_pilot_write.txt"
+        self.extra_paths.append(target)
+        target.write_text("alpha\n", encoding="utf-8")
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+
+        self.store.record_task(
+            "Write pilot file",
+            status="open",
+            area="execution",
+            file_operation="write_text",
+            file_path=str(target.relative_to(Path.cwd())),
+            file_text="updated\n",
+            complete_on_success=True,
+        )
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        runtime = LinuxPilotRuntime(
+            self.store,
+            policy=policy,
+            patch_runner=self._make_runtime_patch_runner(),
+        )
+
+        report = runtime.run_turn("write pilot file", use_model=False)
+
+        self.assertEqual(report.approval.status, "needs_approval")
+        self.assertEqual(report.approval.category, "file_operation")
+        self.assertIsNotNone(report.approval.preview_patch)
+        self.assertIn(target.relative_to(Path.cwd()).as_posix(), report.approval.preview_patch.changed_files)
+        self.assertIn("+updated", report.approval.preview_patch.diff_preview)
+        self.assertIsNone(report.execution_result)
+        self.assertIsNone(report.assistant_event_id)
+        self.assertEqual(target.read_text(encoding="utf-8"), "alpha\n")
+        self.assertIsNotNone(report.trace_path)
+        self.assertTrue(Path(str(report.trace_path)).exists())
+
+    def test_linux_pilot_runtime_auto_executes_read_only_file_tasks(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}_pilot_read.txt"
+        self.extra_paths.append(target)
+        target.write_text("alpha\n", encoding="utf-8")
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+
+        self.store.record_task(
+            "Read pilot file",
+            status="open",
+            area="execution",
+            file_operation="read_text",
+            file_path=str(target.relative_to(Path.cwd())),
+            complete_on_success=True,
+        )
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        runtime = LinuxPilotRuntime(self.store, policy=policy)
+
+        report = runtime.run_turn("read pilot file", use_model=False)
+
+        self.assertEqual(report.approval.status, "auto_approved")
+        self.assertIsNotNone(report.execution_result)
+        self.assertEqual(report.execution_result.status, "success")
+        self.assertIsNotNone(report.execution_result.file_result)
+        self.assertEqual(report.execution_result.file_result.operation, "read_text")
+        self.assertIsNotNone(report.assistant_event_id)
+        self.assertTrue(Path(str(report.trace_path)).exists())
+
+    def test_linux_pilot_runtime_can_execute_write_after_explicit_approval(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}_pilot_approve.txt"
+        self.extra_paths.append(target)
+        target.write_text("alpha\n", encoding="utf-8")
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+
+        self.store.record_task(
+            "Approve pilot write",
+            status="open",
+            area="execution",
+            file_operation="write_text",
+            file_path=str(target.relative_to(Path.cwd())),
+            file_text="approved\n",
+            complete_on_success=True,
+        )
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        self._record_green_baseline()
+        runtime = LinuxPilotRuntime(
+            self.store,
+            policy=policy,
+            patch_runner=self._make_runtime_patch_runner(),
+        )
+
+        report = runtime.run_turn("approve pilot write", use_model=False, approve=True)
+
+        self.assertEqual(report.approval.status, "approved")
+        self.assertIsNotNone(report.execution_result)
+        self.assertEqual(report.execution_result.status, "success")
+        self.assertEqual(report.execution_result.executed_kind, "run_patch_preview")
+        self.assertIsNotNone(report.execution_result.patch_run)
+        self.assertEqual(report.execution_result.patch_run.status, "applied")
+        self.assertEqual(target.read_text(encoding="utf-8"), "approved\n")
+
+    def test_linux_pilot_runtime_can_approve_pending_turn_without_duplicate_user_event(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}_pilot_pending.txt"
+        self.extra_paths.append(target)
+        target.write_text("alpha\n", encoding="utf-8")
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+
+        self.store.record_task(
+            "Queued pilot write",
+            status="open",
+            area="execution",
+            file_operation="write_text",
+            file_path=str(target.relative_to(Path.cwd())),
+            file_text="queued\n",
+            complete_on_success=True,
+        )
+        baseline_events = self.store.stats()["events"]
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        self._record_green_baseline()
+        runtime = LinuxPilotRuntime(
+            self.store,
+            policy=policy,
+            patch_runner=self._make_runtime_patch_runner(),
+        )
+
+        report = runtime.run_turn("queued pilot write", use_model=False)
+
+        self.assertEqual(self.store.stats()["events"], baseline_events + 1)
+        self.assertEqual(report.approval.status, "needs_approval")
+        trace_path = report.trace_path
+
+        approved = runtime.approve_turn(report)
+
+        self.assertEqual(approved.user_event_id, report.user_event_id)
+        self.assertEqual(approved.approval.status, "approved")
+        self.assertIsNotNone(approved.execution_result)
+        self.assertEqual(approved.execution_result.status, "success")
+        self.assertEqual(approved.execution_result.executed_kind, "run_patch_preview")
+        self.assertEqual(target.read_text(encoding="utf-8"), "queued\n")
+        self.assertEqual(self.store.stats()["events"], baseline_events + 2)
+        self.assertEqual(approved.trace_path, trace_path)
+
+    def test_linux_pilot_runtime_uses_model_selected_action_before_execution(self) -> None:
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+        self.store.record_task(
+            "Pilot model selected task",
+            status="open",
+            area="execution",
+        )
+
+        class FakeModelAdapter(BaseModelAdapter):
+            @property
+            def enabled(self) -> bool:
+                return True
+
+            def chat(self, messages: list[ModelMessage]) -> ModelResponse:
+                return ModelResponse(
+                    content=(
+                        '{"assistant_message":"I am starting the selected task now.",'
+                        '"action":{"type":"execute_plan_action","option_id":"A1"}}'
+                    ),
+                    model="fake-model",
+                )
+
+            def status(self) -> dict[str, object]:
+                return {
+                    "enabled": True,
+                    "backend": "fake",
+                    "model": "fake-model",
+                }
+
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        runtime = LinuxPilotRuntime(
+            self.store,
+            policy=policy,
+            model_adapter=FakeModelAdapter(),
+        )
+
+        report = runtime.run_turn("What should I do next?", use_model=True)
+
+        self.assertEqual(report.selected_action_source, "model")
+        self.assertIsNotNone(report.model_action)
+        self.assertEqual(report.model_action.action_type, "execute_plan_action")
+        self.assertIsNotNone(report.execution_result)
+        self.assertEqual(report.execution_result.status, "success")
+        self.assertIn("selected task", str(report.assistant_message).lower())
+
+    def test_linux_pilot_runtime_session_stops_when_approval_is_required(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}_pilot_run_gate.txt"
+        self.extra_paths.append(target)
+        target.write_text("alpha\n", encoding="utf-8")
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+
+        self.store.record_task(
+            "Pilot run gated write",
+            status="open",
+            area="execution",
+            file_operation="write_text",
+            file_path=str(target.relative_to(Path.cwd())),
+            file_text="run-gated\n",
+            complete_on_success=True,
+        )
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        runtime = LinuxPilotRuntime(self.store, policy=policy)
+
+        run = runtime.run_session(
+            "pilot run gated write",
+            max_steps=3,
+            auto_approve=False,
+            use_model=False,
+        )
+
+        self.assertEqual(run.stop_reason, "needs_approval")
+        self.assertEqual(len(run.steps), 1)
+        self.assertEqual(run.executed_steps, 0)
+        self.assertEqual(target.read_text(encoding="utf-8"), "alpha\n")
+
+    def test_linux_pilot_runtime_session_executes_multiple_safe_steps(self) -> None:
+        first = self.temp_root / f"{uuid.uuid4().hex}_pilot_run_first.txt"
+        second = self.temp_root / f"{uuid.uuid4().hex}_pilot_run_second.txt"
+        self.extra_paths.extend([first, second])
+        first.write_text("one\n", encoding="utf-8")
+        second.write_text("two\n", encoding="utf-8")
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+
+        self.store.record_task(
+            "Pilot run first read",
+            status="open",
+            area="execution",
+            file_operation="read_text",
+            file_path=str(first.relative_to(Path.cwd())),
+            complete_on_success=True,
+        )
+        self.store.record_task(
+            "Pilot run second read",
+            status="open",
+            area="execution",
+            file_operation="read_text",
+            file_path=str(second.relative_to(Path.cwd())),
+            complete_on_success=True,
+        )
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        runtime = LinuxPilotRuntime(self.store, policy=policy)
+
+        run = runtime.run_session(
+            "pilot run read",
+            max_steps=2,
+            auto_approve=True,
+            use_model=False,
+        )
+
+        self.assertEqual(len(run.steps), 2)
+        self.assertEqual(run.executed_steps, 2)
+        self.assertEqual(run.stop_reason, "max_steps")
+        self.assertEqual(run.approval_requests, 0)
+        self.assertEqual(run.approvals_granted, 0)
+        self.assertEqual(len(run.trace_paths), 2)
+
+    def test_linux_pilot_runtime_auto_executes_preparation_actions(self) -> None:
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+        for index in range(2):
+            self.store.record_tool_outcome(
+                "pilot-review",
+                f"Pilot review {index} stopped on approval friction",
+                status="blocked",
+                subject="self_improvement",
+                tags=["pilot", "review", "self-improvement"],
+                metadata={
+                    "goal_text": f"pilot history runtime seed {index}",
+                    "stop_reason": "needs_approval",
+                    "executed_steps": 0,
+                    "approval_requests": 1,
+                    "approvals_granted": 0,
+                    "opportunity_count": 1,
+                    "opportunity_categories": ["approval_friction"],
+                    "recurring_patterns": [],
+                },
+            )
+        self.store.record_task(
+            "Pilot runtime risky write",
+            status="open",
+            area="execution",
+            file_operation="write_text",
+            file_path=".test_tmp/pilot_runtime_risky_write.txt",
+            file_text="updated\n",
+            complete_on_success=True,
+        )
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        runtime = LinuxPilotRuntime(self.store, policy=policy)
+
+        report = runtime.run_turn("what should I do next", use_model=False)
+
+        self.assertIsNotNone(report.selected_action)
+        self.assertEqual(report.selected_action.kind, "prepare_task")
+        self.assertEqual(report.approval.status, "auto_approved")
+        self.assertIsNotNone(report.execution_result)
+        self.assertEqual(report.execution_result.executed_kind, "prepare_task")
+        self.assertEqual(report.execution_result.status, "success")
+        self.assertIsNotNone(report.after_plan)
+        self.assertEqual(
+            report.after_plan.recommendation.title,
+            "Prepare safer execution for Pilot runtime risky write",
+        )
+
+    def test_pilot_run_review_flags_approval_friction_and_promotes_task(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}_pilot_review_gate.txt"
+        self.extra_paths.append(target)
+        target.write_text("alpha\n", encoding="utf-8")
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+
+        self.store.record_task(
+            "Pilot review gated write",
+            status="open",
+            area="execution",
+            file_operation="write_text",
+            file_path=str(target.relative_to(Path.cwd())),
+            file_text="reviewed\n",
+            complete_on_success=True,
+        )
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        runtime = LinuxPilotRuntime(self.store, policy=policy)
+        run = runtime.run_session(
+            "pilot review gated write",
+            max_steps=2,
+            auto_approve=False,
+            use_model=False,
+        )
+
+        reviewer = PilotRunReviewer(self.store)
+        review = reviewer.review(run, promote_limit=1)
+
+        self.assertEqual(review.stop_reason, "needs_approval")
+        self.assertTrue(review.opportunities)
+        self.assertEqual(review.opportunities[0].category, "approval_friction")
+        self.assertEqual(len(review.promoted_tasks), 1)
+        self.assertIn("Reduce pilot approval friction", review.promoted_tasks[0].content)
+        self.assertIsNotNone(review.review_outcome)
+
+    def test_pilot_run_review_recognizes_recurring_cross_run_patterns(self) -> None:
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        reviewer = PilotRunReviewer(self.store)
+        for index in range(2):
+            target = self.temp_root / f"{uuid.uuid4().hex}_pilot_history_{index}.txt"
+            self.extra_paths.append(target)
+            target.write_text("alpha\n", encoding="utf-8")
+            trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+            self.extra_dirs.append(trace_dir)
+            policy.trace_dir = trace_dir
+            self.store.record_task(
+                f"Pilot recurring write {index}",
+                status="open",
+                area="execution",
+                file_operation="write_text",
+                file_path=str(target.relative_to(Path.cwd())),
+                file_text="beta\n",
+                complete_on_success=True,
+            )
+            runtime = LinuxPilotRuntime(self.store, policy=policy)
+            run = runtime.run_session(
+                f"pilot recurring write {index}",
+                max_steps=2,
+                auto_approve=False,
+                use_model=False,
+            )
+            review = reviewer.review(run, promote_limit=0)
+
+        self.assertTrue(review.recurring_patterns)
+        pattern_kinds = {pattern["kind"] for pattern in review.recurring_patterns}
+        self.assertIn("category", pattern_kinds)
+        self.assertIn("stop_reason", pattern_kinds)
+        history_opportunities = [
+            item for item in review.opportunities if item.category == "pilot_history_pattern"
+        ]
+        self.assertTrue(history_opportunities)
+        self.assertIn("recurring", history_opportunities[0].title.lower())
+
+    def test_pilot_history_report_aggregates_recent_pilot_reviews(self) -> None:
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        reviewer = PilotRunReviewer(self.store)
+        for index in range(2):
+            target = self.temp_root / f"{uuid.uuid4().hex}_pilot_report_{index}.txt"
+            self.extra_paths.append(target)
+            target.write_text("alpha\n", encoding="utf-8")
+            trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+            self.extra_dirs.append(trace_dir)
+            policy.trace_dir = trace_dir
+            self.store.record_task(
+                f"Pilot report write {index}",
+                status="open",
+                area="execution",
+                file_operation="write_text",
+                file_path=str(target.relative_to(Path.cwd())),
+                file_text="beta\n",
+                complete_on_success=True,
+            )
+            runtime = LinuxPilotRuntime(self.store, policy=policy)
+            run = runtime.run_session(
+                f"pilot report write {index}",
+                max_steps=2,
+                auto_approve=False,
+                use_model=False,
+            )
+            reviewer.review(run, promote_limit=0)
+
+        report = PilotHistoryReporter(self.store).build(limit=10)
+
+        self.assertEqual(report.total_reviews, 2)
+        self.assertTrue(report.stop_reasons)
+        self.assertEqual(report.stop_reasons[0]["key"], "needs_approval")
+        self.assertTrue(report.opportunity_categories)
+        self.assertEqual(report.opportunity_categories[0]["key"], "approval_friction")
+        self.assertTrue(report.recurring_patterns)
+        self.assertEqual(report.recurring_patterns[0]["kind"], "category")
+
+    def test_pilot_chat_prompts_and_executes_approved_turn(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}_pilot_chat.txt"
+        self.extra_paths.append(target)
+        target.write_text("alpha\n", encoding="utf-8")
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+        policy_path = self.temp_root / f"{uuid.uuid4().hex}_pilot_policy.toml"
+        self.extra_paths.append(policy_path)
+
+        self.store.record_task(
+            "Pilot chat write",
+            status="open",
+            area="execution",
+            file_operation="write_text",
+            file_path=str(target.relative_to(Path.cwd())),
+            file_text="chat-approved\n",
+            complete_on_success=True,
+        )
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        policy_path.write_text(policy.render_template(), encoding="utf-8")
+        self._record_green_baseline()
+
+        inputs = iter(["pilot chat write", "yes", ":quit"])
+        outputs: list[str] = []
+
+        def fake_input(_prompt: str) -> str:
+            return next(inputs)
+
+        def fake_output(text: str) -> None:
+            outputs.append(text)
+
+        original_runtime = cli_module.LinuxPilotRuntime
+
+        class TestLinuxPilotRuntime(original_runtime):
+            def __init__(self, memory_store, **kwargs):
+                kwargs.setdefault(
+                    "patch_runner",
+                    self_outer._make_runtime_patch_runner(),
+                )
+                super().__init__(memory_store, **kwargs)
+
+        self_outer = self
+        cli_module.LinuxPilotRuntime = TestLinuxPilotRuntime
+        try:
+            result = _run_pilot_chat(
+                self.store,
+                policy_file=policy_path,
+                use_model=False,
+                input_fn=fake_input,
+                output_fn=fake_output,
+            )
+        finally:
+            cli_module.LinuxPilotRuntime = original_runtime
+
+        self.assertEqual(result, 0)
+        self.assertEqual(target.read_text(encoding="utf-8"), "chat-approved\n")
+        rendered = "\n".join(outputs)
+        self.assertIn("Supervised Linux pilot session", rendered)
+        self.assertIn("Approval: [needs_approval]", rendered)
+        self.assertIn("Preview packet:", rendered)
+        self.assertIn("Approved and executed queued action.", rendered)
+
+    def test_executor_runs_python_symbol_replace_and_completes_task(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}.py"
+        self.extra_paths.append(target)
+        target.write_text(
+            "def greet(name: str) -> str:\n"
+            "    return f'hello {name}'\n\n"
+            "def untouched() -> str:\n"
+            "    return 'still here'\n",
+            encoding="utf-8",
+        )
+        self.store.record_task(
+            "Upgrade greet helper",
+            status="open",
+            area="execution",
+            file_operation="replace_python_function",
+            file_path=str(target.relative_to(Path.cwd())),
+            symbol_name="greet",
+            file_text=(
+                "def greet(name: str) -> str:\n"
+                "    return f'hello there {name}'\n"
+            ),
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("upgrade greet helper", action_limit=3)
+
+        self.assertEqual(cycle.result.executed_kind, "run_file_operation")
+        self.assertEqual(cycle.result.status, "success")
+        self.assertIsNotNone(cycle.result.file_result)
+        self.assertEqual(cycle.result.task_update.metadata.get("status"), "done")
+        updated = target.read_text(encoding="utf-8")
+        self.assertIn("hello there", updated)
+        self.assertIn("still here", updated)
+        self.assertIn("greet", str(cycle.result.metadata.get("symbol_name")))
+
+    def test_executor_runs_python_symbol_replace_on_utf8_bom_file(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}.py"
+        self.extra_paths.append(target)
+        target.write_text(
+            "def greet() -> str:\n    return 'old'\n",
+            encoding="utf-8-sig",
+        )
+        self.store.record_task(
+            "Upgrade BOM greet helper",
+            status="open",
+            area="execution",
+            file_operation="replace_python_function",
+            file_path=str(target.relative_to(Path.cwd())),
+            symbol_name="greet",
+            file_text="def greet() -> str:\n    return 'new'\n",
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("upgrade bom greet helper", action_limit=3)
+
+        self.assertEqual(cycle.result.status, "success")
+        self.assertIn("return 'new'", target.read_text(encoding="utf-8"))
+
+    def test_executor_inserts_python_symbol_after_target_and_completes_task(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}.py"
+        self.extra_paths.append(target)
+        target.write_text(
+            "def greet() -> str:\n"
+            "    return 'hello'\n",
+            encoding="utf-8",
+        )
+        self.store.record_task(
+            "Add helper after greet",
+            status="open",
+            area="execution",
+            file_operation="insert_python_after_symbol",
+            file_path=str(target.relative_to(Path.cwd())),
+            symbol_name="greet",
+            file_text="def helper() -> str:\n    return 'helper'\n",
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("add helper after greet", action_limit=3)
+
+        self.assertEqual(cycle.result.status, "success")
+        updated = target.read_text(encoding="utf-8")
+        self.assertIn("def greet()", updated)
+        self.assertIn("def helper()", updated)
+        self.assertLess(updated.index("def greet()"), updated.index("def helper()"))
+
+    def test_executor_renames_python_identifier_and_completes_task(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}.py"
+        self.extra_paths.append(target)
+        target.write_text(
+            "def greet() -> str:\n"
+            "    return 'hello'\n\n"
+            "value = greet()\n"
+            "label = 'greet should stay in strings'\n",
+            encoding="utf-8",
+        )
+        self.store.record_task(
+            "Rename greet helper",
+            status="open",
+            area="execution",
+            file_operation="rename_python_identifier",
+            file_path=str(target.relative_to(Path.cwd())),
+            symbol_name="greet",
+            file_text="salute",
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("rename greet helper", action_limit=3)
+
+        self.assertEqual(cycle.result.status, "success")
+        updated = target.read_text(encoding="utf-8")
+        self.assertIn("def salute()", updated)
+        self.assertIn("value = salute()", updated)
+        self.assertIn("'greet should stay in strings'", updated)
+
+    def test_executor_renames_python_method_and_completes_task(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}.py"
+        self.extra_paths.append(target)
+        target.write_text(
+            "class Greeter:\n"
+            "    def speak(self) -> str:\n"
+            "        return 'hello'\n\n"
+            "greeter = Greeter()\n"
+            "value = greeter.speak()\n"
+            "method_ref = Greeter.speak\n"
+            "label = 'speak should stay in strings'\n",
+            encoding="utf-8",
+        )
+        self.store.record_task(
+            "Rename speak method",
+            status="open",
+            area="execution",
+            file_operation="rename_python_method",
+            file_path=str(target.relative_to(Path.cwd())),
+            symbol_name="Greeter.speak",
+            file_text="salute",
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("rename speak method", action_limit=3)
+
+        self.assertEqual(cycle.result.status, "success")
+        updated = target.read_text(encoding="utf-8")
+        self.assertIn("def salute(self)", updated)
+        self.assertIn("value = greeter.salute()", updated)
+        self.assertIn("method_ref = Greeter.salute", updated)
+        self.assertIn("'speak should stay in strings'", updated)
+
+    def test_executor_adds_python_import_and_completes_task(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}.py"
+        self.extra_paths.append(target)
+        target.write_text(
+            "\"\"\"Module docstring.\"\"\"\n\n"
+            "from __future__ import annotations\n\n"
+            "class Greeter:\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+        self.store.record_task(
+            "Add pathlib import",
+            status="open",
+            area="execution",
+            file_operation="add_python_import",
+            file_path=str(target.relative_to(Path.cwd())),
+            file_text="from pathlib import Path",
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("add pathlib import", action_limit=3)
+
+        self.assertEqual(cycle.result.status, "success")
+        updated = target.read_text(encoding="utf-8")
+        self.assertIn("from __future__ import annotations\nfrom pathlib import Path\n", updated)
+        self.assertIn("class Greeter", updated)
+
+    def test_executor_removes_python_import_and_completes_task(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}.py"
+        self.extra_paths.append(target)
+        target.write_text(
+            "from pathlib import Path\n"
+            "import json\n\n"
+            "VALUE = 1\n",
+            encoding="utf-8",
+        )
+        self.store.record_task(
+            "Remove pathlib import",
+            status="open",
+            area="execution",
+            file_operation="remove_python_import",
+            file_path=str(target.relative_to(Path.cwd())),
+            file_text="from pathlib import Path",
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("remove pathlib import", action_limit=3)
+
+        self.assertEqual(cycle.result.status, "success")
+        updated = target.read_text(encoding="utf-8")
+        self.assertNotIn("from pathlib import Path", updated)
+        self.assertIn("import json", updated)
+        self.assertIn("VALUE = 1", updated)
+
+    def test_executor_adds_python_function_parameter_and_rewrites_calls(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}.py"
+        self.extra_paths.append(target)
+        target.write_text(
+            "def greet(name: str) -> str:\n"
+            "    return name.upper()\n\n"
+            "value = greet('sam')\n",
+            encoding="utf-8",
+        )
+        self.store.record_task(
+            "Add excited parameter to greet",
+            status="open",
+            area="execution",
+            file_operation="add_python_function_parameter",
+            file_path=str(target.relative_to(Path.cwd())),
+            symbol_name="greet",
+            file_text=json.dumps(
+                {
+                    "parameter_name": "excited",
+                    "call_argument": "True",
+                }
+            ),
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("add excited parameter to greet", action_limit=3)
+
+        self.assertEqual(cycle.result.status, "success")
+        updated = target.read_text(encoding="utf-8")
+        self.assertIn("def greet(name: str, excited)", updated)
+        self.assertIn("value = greet('sam', excited=True)", updated)
+
+    def test_executor_adds_python_method_parameter_and_rewrites_calls(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}.py"
+        self.extra_paths.append(target)
+        target.write_text(
+            "class Greeter:\n"
+            "    def speak(self, name: str) -> str:\n"
+            "        return name.upper()\n\n"
+            "greeter = Greeter()\n"
+            "value = greeter.speak('sam')\n",
+            encoding="utf-8",
+        )
+        self.store.record_task(
+            "Add excited parameter to Greeter.speak",
+            status="open",
+            area="execution",
+            file_operation="add_python_method_parameter",
+            file_path=str(target.relative_to(Path.cwd())),
+            symbol_name="Greeter.speak",
+            file_text=json.dumps(
+                {
+                    "parameter_name": "excited",
+                    "call_argument": "True",
+                }
+            ),
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("add excited parameter to greeter.speak", action_limit=3)
+
+        self.assertEqual(cycle.result.status, "success")
+        updated = target.read_text(encoding="utf-8")
+        self.assertIn("def speak(self, name: str, excited)", updated)
+        self.assertIn("value = greeter.speak('sam', excited=True)", updated)
+
+    def test_executor_blocks_signature_refactor_for_multiline_callsites_without_default(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}.py"
+        self.extra_paths.append(target)
+        original = (
+            "def greet(name: str) -> str:\n"
+            "    return name.upper()\n\n"
+            "value = greet(\n"
+            "    'sam',\n"
+            ")\n"
+        )
+        target.write_text(original, encoding="utf-8")
+        self.store.record_task(
+            "Add parameter with multiline calls",
+            status="open",
+            area="execution",
+            file_operation="add_python_function_parameter",
+            file_path=str(target.relative_to(Path.cwd())),
+            symbol_name="greet",
+            file_text=json.dumps(
+                {
+                    "parameter_name": "excited",
+                    "call_argument": "True",
+                }
+            ),
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("add parameter with multiline calls", action_limit=3)
+
+        self.assertEqual(cycle.result.status, "blocked")
+        self.assertIsNotNone(cycle.result.file_result)
+        self.assertEqual(
+            cycle.result.file_result.reason,
+            "multiline_call_sites_not_supported",
+        )
+        self.assertEqual(target.read_text(encoding="utf-8"), original)
+
+    def test_executor_renames_python_export_across_imports_and_completes_task(self) -> None:
+        workspace = Path.cwd() / f"refactorws_{uuid.uuid4().hex[:8]}"
+        package = workspace / f"pkgrefactor_{uuid.uuid4().hex[:8]}"
+        package.mkdir(parents=True, exist_ok=True)
+        self.extra_dirs.append(workspace)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        source = package / "greeter.py"
+        consumer = workspace / "consumer.py"
+        module_consumer = workspace / "module_consumer.py"
+        source.write_text(
+            "def greet(name: str) -> str:\n"
+            "    return name.upper()\n\n"
+            "value = greet('sam')\n",
+            encoding="utf-8",
+        )
+        consumer.write_text(
+            f"from {package.name}.greeter import greet\n"
+            "result = greet('zoe')\n",
+            encoding="utf-8",
+        )
+        module_consumer.write_text(
+            f"import {package.name}.greeter as greeter_mod\n"
+            "other = greeter_mod.greet('amy')\n",
+            encoding="utf-8",
+        )
+        self.store.record_task(
+            "Rename greet export across imports",
+            status="open",
+            area="execution",
+            file_operation="rename_python_export_across_imports",
+            file_path=str(source.relative_to(Path.cwd())),
+            symbol_name="greet",
+            file_text="salute",
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("rename greet export across imports", action_limit=3)
+
+        self.assertEqual(cycle.result.status, "success")
+        self.assertIsNotNone(cycle.result.file_result)
+        source_text = source.read_text(encoding="utf-8")
+        consumer_text = consumer.read_text(encoding="utf-8")
+        module_consumer_text = module_consumer.read_text(encoding="utf-8")
+        self.assertIn("def salute(name: str)", source_text)
+        self.assertIn("value = salute('sam')", source_text)
+        self.assertIn(f"from {package.name}.greeter import salute", consumer_text)
+        self.assertIn("result = salute('zoe')", consumer_text)
+        self.assertIn("greeter_mod.salute('amy')", module_consumer_text)
+        changed_paths = set(cycle.result.file_result.changed_paths)
+        self.assertIn(str(source.resolve()), changed_paths)
+        self.assertIn(str(consumer.resolve()), changed_paths)
+        self.assertIn(str(module_consumer.resolve()), changed_paths)
+
+    def test_executor_blocks_cross_import_rename_when_consumer_binding_conflicts(self) -> None:
+        workspace = Path.cwd() / f"refactorws_{uuid.uuid4().hex[:8]}"
+        package = workspace / f"pkgrefactor_{uuid.uuid4().hex[:8]}"
+        package.mkdir(parents=True, exist_ok=True)
+        self.extra_dirs.append(workspace)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        source = package / "greeter.py"
+        consumer = workspace / "consumer.py"
+        original_source = "def greet(name: str) -> str:\n    return name.upper()\n"
+        original_consumer = (
+            f"from {package.name}.greeter import greet\n"
+            "greet = 'local shadow'\n"
+            "result = greet\n"
+        )
+        source.write_text(original_source, encoding="utf-8")
+        consumer.write_text(original_consumer, encoding="utf-8")
+        self.store.record_task(
+            "Rename greet export with conflicting consumer",
+            status="open",
+            area="execution",
+            file_operation="rename_python_export_across_imports",
+            file_path=str(source.relative_to(Path.cwd())),
+            symbol_name="greet",
+            file_text="salute",
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("rename greet export with conflicting consumer", action_limit=3)
+
+        self.assertEqual(cycle.result.status, "blocked")
+        self.assertIsNotNone(cycle.result.file_result)
+        self.assertEqual(cycle.result.file_result.reason, "consumer_binding_conflict")
+        self.assertEqual(source.read_text(encoding="utf-8"), original_source)
+        self.assertEqual(consumer.read_text(encoding="utf-8"), original_consumer)
+
+    def test_executor_moves_python_export_to_module_and_updates_import_consumers(self) -> None:
+        workspace = Path.cwd() / f"movews_{uuid.uuid4().hex[:8]}"
+        package = workspace / f"pkgmove_{uuid.uuid4().hex[:8]}"
+        package.mkdir(parents=True, exist_ok=True)
+        self.extra_dirs.append(workspace)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        source = package / "legacy.py"
+        destination = package / "core.py"
+        consumer = workspace / "consumer.py"
+        module_consumer = workspace / "module_consumer.py"
+        source.write_text(
+            "from pathlib import Path\n\n"
+            "def greet(name: str) -> str:\n"
+            "    return Path(name).name.upper()\n\n"
+            "value = greet('sam.txt')\n",
+            encoding="utf-8",
+        )
+        consumer.write_text(
+            f"from {package.name}.legacy import greet\n"
+            "result = greet('zoe.txt')\n",
+            encoding="utf-8",
+        )
+        module_consumer.write_text(
+            f"import {package.name}.legacy as legacy_mod\n"
+            "other = legacy_mod.greet('amy.txt')\n",
+            encoding="utf-8",
+        )
+        self.store.record_task(
+            "Move greet export to core module",
+            status="open",
+            area="execution",
+            file_operation="move_python_export_to_module",
+            file_path=str(source.relative_to(Path.cwd())),
+            symbol_name="greet",
+            file_text=json.dumps(
+                {
+                    "destination_path": str(destination.relative_to(Path.cwd())),
+                }
+            ),
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("move greet export to core module", action_limit=3)
+
+        self.assertEqual(cycle.result.status, "success")
+        self.assertIsNotNone(cycle.result.file_result)
+        source_text = source.read_text(encoding="utf-8")
+        destination_text = destination.read_text(encoding="utf-8")
+        consumer_text = consumer.read_text(encoding="utf-8")
+        module_consumer_text = module_consumer.read_text(encoding="utf-8")
+        self.assertIn(f"from {package.name}.core import greet", source_text)
+        self.assertNotIn("def greet(name: str)", source_text)
+        self.assertIn("value = greet('sam.txt')", source_text)
+        self.assertIn("from pathlib import Path", destination_text)
+        self.assertIn("def greet(name: str)", destination_text)
+        self.assertIn("return Path(name).name.upper()", destination_text)
+        self.assertIn(f"from {package.name}.core import greet", consumer_text)
+        self.assertIn("result = greet('zoe.txt')", consumer_text)
+        self.assertIn(f"import {package.name}.legacy as legacy_mod", module_consumer_text)
+        self.assertIn("legacy_mod.greet('amy.txt')", module_consumer_text)
+        changed_paths = set(cycle.result.file_result.changed_paths)
+        self.assertIn(str(source.resolve()), changed_paths)
+        self.assertIn(str(destination.resolve()), changed_paths)
+        self.assertIn(str(consumer.resolve()), changed_paths)
+        self.assertNotIn(str(module_consumer.resolve()), changed_paths)
+
+    def test_executor_blocks_move_python_export_when_consumer_import_split_is_required(self) -> None:
+        workspace = Path.cwd() / f"movews_{uuid.uuid4().hex[:8]}"
+        package = workspace / f"pkgmove_{uuid.uuid4().hex[:8]}"
+        package.mkdir(parents=True, exist_ok=True)
+        self.extra_dirs.append(workspace)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        source = package / "legacy.py"
+        destination = package / "core.py"
+        consumer = workspace / "consumer.py"
+        original_source = (
+            "def greet(name: str) -> str:\n"
+            "    return name.upper()\n\n"
+            "def helper(name: str) -> str:\n"
+            "    return name.lower()\n"
+        )
+        source.write_text(original_source, encoding="utf-8")
+        original_consumer = (
+            f"from {package.name}.legacy import greet, helper\n"
+            "value = greet('sam')\n"
+        )
+        consumer.write_text(original_consumer, encoding="utf-8")
+        self.store.record_task(
+            "Move greet export with split import consumer",
+            status="open",
+            area="execution",
+            file_operation="move_python_export_to_module",
+            file_path=str(source.relative_to(Path.cwd())),
+            symbol_name="greet",
+            file_text=json.dumps(
+                {
+                    "destination_path": str(destination.relative_to(Path.cwd())),
+                }
+            ),
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(
+            self.store,
+            file_adapter=WorkspaceFileAdapter(workspace_root=Path.cwd()),
+        )
+        cycle = executor.execute_next("move greet export with split import consumer", action_limit=3)
+
+        self.assertEqual(cycle.result.status, "blocked")
+        self.assertIsNotNone(cycle.result.file_result)
+        self.assertEqual(cycle.result.file_result.reason, "consumer_import_split_required")
+        self.assertEqual(source.read_text(encoding="utf-8"), original_source)
+        self.assertEqual(consumer.read_text(encoding="utf-8"), original_consumer)
+        self.assertFalse(destination.exists())
+
+    def test_file_adapter_blocks_outside_workspace_path(self) -> None:
+        outside_path = Path.cwd().parent / f"{uuid.uuid4().hex}.txt"
+        self.store.record_task(
+            "Write outside workspace",
+            status="open",
+            area="execution",
+            file_operation="write_text",
+            file_path=str(outside_path),
+            file_text="outside",
+        )
+
+        executor = MemoryExecutor(self.store)
+        cycle = executor.execute_next("write outside workspace", action_limit=3)
+
+        self.assertEqual(cycle.result.executed_kind, "run_file_operation")
+        self.assertEqual(cycle.result.status, "blocked")
+        self.assertIsNotNone(cycle.result.file_result)
+        self.assertEqual(cycle.result.file_result.reason, "path_outside_workspace")
+        self.assertIn("blocked by file policy", cycle.result.summary.lower())
+
+    def test_improvement_review_records_evaluation_and_promotes_code_patching_backlog(self) -> None:
+        class FakeEvaluator:
+            def run_builtin_suite(self):
+                return EvalSuiteResult(
+                    passed=True,
+                    score=1.0,
+                    scenario_results=[
+                        EvalScenarioResult(
+                            name="all_green",
+                            description="Everything passed.",
+                            passed=True,
+                            score=1.0,
+                            checks=[
+                                EvalCheckResult(
+                                    name="green",
+                                    passed=True,
+                                    details="All checks passed.",
+                                )
+                            ],
+                        )
+                    ],
+                )
+
+        engine = MemoryImprovementEngine(self.store, FakeEvaluator())
+        review = engine.review(promote_limit=2)
+
+        self.assertTrue(review.passed)
+        self.assertIsNotNone(review.current_evaluation)
+        self.assertEqual(review.current_evaluation["checks_passed"], 1)
+        self.assertIsNotNone(self.store.latest_evaluation_run())
+        self.assertTrue(
+            any(
+                opportunity.title == "Add code-aware patching primitives"
+                for opportunity in review.opportunities
+            )
+        )
+        self.assertTrue(
+            any(
+                str(task.metadata.get("title")) == "Add code-aware patching primitives"
+                for task in review.promoted_tasks
+            )
+        )
+        self.assertIsNotNone(
+            self.store.find_active_task(
+                "Add code-aware patching primitives",
+                area="self_improvement",
+            )
+        )
+
+    def test_improvement_review_turns_failed_eval_checks_into_self_improvement_tasks(self) -> None:
+        class FakeEvaluator:
+            def run_builtin_suite(self):
+                return EvalSuiteResult(
+                    passed=False,
+                    score=0.5,
+                    scenario_results=[
+                        EvalScenarioResult(
+                            name="broken_path",
+                            description="A key scenario failed.",
+                            passed=False,
+                            score=0.0,
+                            checks=[
+                                EvalCheckResult(
+                                    name="missing guardrail",
+                                    passed=False,
+                                    details="The execution path skipped validation.",
+                                )
+                            ],
+                        )
+                    ],
+                )
+
+        engine = MemoryImprovementEngine(self.store, FakeEvaluator())
+        review = engine.review(promote_limit=1, include_strategic_backlog=False)
+
+        self.assertFalse(review.passed)
+        self.assertTrue(
+            any(
+                opportunity.category == "evaluation_failure"
+                and "broken_path" in opportunity.title
+                for opportunity in review.opportunities
+            )
+        )
+        self.assertEqual(len(review.promoted_tasks), 1)
+        self.assertEqual(
+            review.promoted_tasks[0].subject,
+            "self_improvement",
+        )
+        self.assertIn(
+            "Resolve failing evaluation scenario",
+            str(review.promoted_tasks[0].metadata.get("details") or ""),
+        )
+        latest_outcome = self.store.get_recent_tool_outcomes(limit=1)[0]
+        self.assertEqual(latest_outcome.subject, "self_improvement")
+
+    def test_patch_runner_applies_validated_candidate_and_records_patch_run(self) -> None:
+        self._record_green_baseline()
+        workspace = self._make_workspace()
+        target = workspace / "target.txt"
+        target.write_text("alpha\nbeta\n", encoding="utf-8")
+
+        def fake_runner(argv, cwd, capture_output, text, timeout, shell):
+            self.assertFalse(shell)
+            if argv[:3] == ["python", "-m", "memory_agent.cli"]:
+                payload = {
+                    "passed": True,
+                    "score": 1.0,
+                    "scenario_results": [
+                        {
+                            "name": "candidate",
+                            "description": "Candidate eval passed.",
+                            "passed": True,
+                            "score": 1.0,
+                            "checks": [
+                                {
+                                    "name": "candidate-check",
+                                    "passed": True,
+                                    "details": "All checks passed.",
+                                }
+                            ],
+                        }
+                    ],
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        runner = WorkspacePatchRunner(
+            self.store,
+            workspace_root=workspace,
+            shell_runner=fake_runner,
+        )
+        report = runner.run(
+            "promote target update",
+            operations=[
+                PatchOperation(
+                    operation="replace_text",
+                    path="target.txt",
+                    find_text="beta",
+                    text="gamma",
+                )
+            ],
+            apply_on_success=True,
+        )
+
+        self.assertEqual(report.status, "applied")
+        self.assertTrue(report.applied)
+        self.assertEqual(target.read_text(encoding="utf-8"), "alpha\ngamma\n")
+        self.assertEqual(report.changed_files, ["target.txt"])
+        self.assertIsNotNone(report.tool_outcome)
+        self.assertEqual(report.tool_outcome.metadata.get("patch_run_id"), report.run_id)
+        latest_patch_run = self.store.latest_patch_run()
+        self.assertIsNotNone(latest_patch_run)
+        self.assertEqual(latest_patch_run["status"], "applied")
+        self.assertEqual(latest_patch_run["changed_files"], ["target.txt"])
+
+    def test_patch_runner_commits_successful_candidate_to_disposable_git_branch(self) -> None:
+        self._record_green_baseline()
+        workspace = self._make_workspace()
+        target = workspace / "target.txt"
+        target.write_text("alpha\nbeta\n", encoding="utf-8")
+        repo_root = str(workspace.resolve())
+        calls: list[list[str]] = []
+        state = {
+            "current_branch": "main",
+            "branches": {"main": "main-head"},
+            "commit_counter": 0,
+        }
+
+        def fake_runner(argv, cwd, capture_output, text, timeout, shell):
+            self.assertFalse(shell)
+            calls.append([str(part) for part in argv])
+            command = [str(part) for part in argv]
+            if command[:3] == ["git", "rev-parse", "--show-toplevel"]:
+                return subprocess.CompletedProcess(argv, 0, repo_root, "")
+            if command[:3] == ["git", "branch", "--show-current"]:
+                return subprocess.CompletedProcess(argv, 0, state["current_branch"], "")
+            if command[:3] == ["git", "status", "--porcelain"]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if command[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    state["branches"][state["current_branch"]],
+                    "",
+                )
+            if len(command) == 3 and command[:2] == ["git", "rev-parse"]:
+                branch = command[2]
+                if branch in state["branches"]:
+                    return subprocess.CompletedProcess(argv, 0, state["branches"][branch], "")
+                return subprocess.CompletedProcess(argv, 1, "", "unknown branch")
+            if command[:3] == ["git", "checkout", "-b"]:
+                branch = command[3]
+                state["branches"][branch] = state["branches"][state["current_branch"]]
+                state["current_branch"] = branch
+                return subprocess.CompletedProcess(argv, 0, f"Switched to {branch}", "")
+            if command[:2] == ["git", "add"]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if "commit" in command:
+                state["commit_counter"] += 1
+                state["branches"][state["current_branch"]] = (
+                    f"commit-{state['commit_counter']}"
+                )
+                return subprocess.CompletedProcess(argv, 0, "[branch] commit", "")
+            if command[:3] == ["python", "-m", "memory_agent.cli"]:
+                payload = {
+                    "passed": True,
+                    "score": 1.0,
+                    "scenario_results": [
+                        {
+                            "name": "candidate",
+                            "description": "Candidate eval passed.",
+                            "passed": True,
+                            "score": 1.0,
+                            "checks": [
+                                {
+                                    "name": "candidate-check",
+                                    "passed": True,
+                                    "details": "All checks passed.",
+                                }
+                            ],
+                        }
+                    ],
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        runner = WorkspacePatchRunner(
+            self.store,
+            workspace_root=workspace,
+            shell_runner=fake_runner,
+            git_mode="auto",
+        )
+        report = runner.run(
+            "promote target update",
+            operations=[
+                PatchOperation(
+                    operation="replace_text",
+                    path="target.txt",
+                    find_text="beta",
+                    text="gamma",
+                )
+            ],
+            apply_on_success=True,
+        )
+
+        self.assertEqual(report.status, "applied")
+        self.assertEqual(target.read_text(encoding="utf-8"), "alpha\ngamma\n")
+        self.assertIsNotNone(report.git_apply)
+        self.assertEqual(report.git_apply.status, "applied")
+        self.assertTrue(str(report.git_apply.branch_name).startswith("codex/patch-run/"))
+        self.assertEqual(report.git_apply.original_branch, "main")
+        self.assertTrue(report.git_apply.rollback_ready)
+        self.assertIn("git checkout main", report.git_apply.rollback_hint)
+        latest_patch_run = self.store.latest_patch_run()
+        self.assertIsNotNone(latest_patch_run)
+        self.assertEqual(latest_patch_run["summary"]["git"]["status"], "applied")
+        self.assertEqual(latest_patch_run["summary"]["git"]["original_branch"], "main")
+        joined_calls = "\n".join(" ".join(call) for call in calls)
+        self.assertIn("git checkout -b", joined_calls)
+        self.assertIn("git add -- target.txt", joined_calls)
+        self.assertIn("git -c user.name=Codex -c user.email=codex@local.invalid commit --no-verify -m codex: apply patch run promote target update", joined_calls)
+
+    def test_patch_runner_rolls_back_disposable_git_branch(self) -> None:
+        self._record_green_baseline()
+        workspace = self._make_workspace()
+        target = workspace / "target.txt"
+        target.write_text("alpha\nbeta\n", encoding="utf-8")
+        repo_root = str(workspace.resolve())
+        state = {
+            "current_branch": "main",
+            "branches": {"main": "main-head"},
+            "commit_counter": 0,
+        }
+
+        def fake_runner(argv, cwd, capture_output, text, timeout, shell):
+            self.assertFalse(shell)
+            command = [str(part) for part in argv]
+            if command[:3] == ["git", "rev-parse", "--show-toplevel"]:
+                return subprocess.CompletedProcess(argv, 0, repo_root, "")
+            if command[:3] == ["git", "branch", "--show-current"]:
+                return subprocess.CompletedProcess(argv, 0, state["current_branch"], "")
+            if command[:3] == ["git", "status", "--porcelain"]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if command[:3] == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    state["branches"][state["current_branch"]],
+                    "",
+                )
+            if len(command) == 3 and command[:2] == ["git", "rev-parse"]:
+                branch = command[2]
+                if branch in state["branches"]:
+                    return subprocess.CompletedProcess(argv, 0, state["branches"][branch], "")
+                return subprocess.CompletedProcess(argv, 1, "", "unknown branch")
+            if command[:3] == ["git", "checkout", "-b"]:
+                branch = command[3]
+                state["branches"][branch] = state["branches"][state["current_branch"]]
+                state["current_branch"] = branch
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if command[:2] == ["git", "checkout"]:
+                branch = command[2]
+                if branch not in state["branches"]:
+                    return subprocess.CompletedProcess(argv, 1, "", "unknown branch")
+                state["current_branch"] = branch
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if command[:2] == ["git", "add"]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if command[:3] == ["git", "branch", "-D"]:
+                branch = command[3]
+                if branch in state["branches"] and branch != state["current_branch"]:
+                    del state["branches"][branch]
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return subprocess.CompletedProcess(argv, 1, "", "cannot delete")
+            if "commit" in command:
+                state["commit_counter"] += 1
+                state["branches"][state["current_branch"]] = (
+                    f"commit-{state['commit_counter']}"
+                )
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if command[:3] == ["python", "-m", "memory_agent.cli"]:
+                payload = {
+                    "passed": True,
+                    "score": 1.0,
+                    "scenario_results": [
+                        {
+                            "name": "candidate",
+                            "description": "Candidate eval passed.",
+                            "passed": True,
+                            "score": 1.0,
+                            "checks": [
+                                {
+                                    "name": "candidate-check",
+                                    "passed": True,
+                                    "details": "All checks passed.",
+                                }
+                            ],
+                        }
+                    ],
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        runner = WorkspacePatchRunner(
+            self.store,
+            workspace_root=workspace,
+            shell_runner=fake_runner,
+            git_mode="auto",
+        )
+        applied = runner.run(
+            "promote target update",
+            operations=[
+                PatchOperation(
+                    operation="replace_text",
+                    path="target.txt",
+                    find_text="beta",
+                    text="gamma",
+                )
+            ],
+            apply_on_success=True,
+        )
+
+        rollback = runner.rollback(applied.run_id)
+
+        self.assertEqual(rollback.status, "rolled_back")
+        self.assertTrue(rollback.deleted_branch)
+        self.assertEqual(rollback.switched_to, "main")
+        self.assertEqual(state["current_branch"], "main")
+        self.assertNotIn(applied.git_apply.branch_name, state["branches"])
+        self.assertIsNotNone(rollback.tool_outcome)
+
+    def test_handoff_pack_creates_linux_bundle_with_state(self) -> None:
+        workspace = self._make_workspace()
+        agent_dir = workspace / ".agent"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        export_db = agent_dir / "agent_memory.sqlite3"
+        traces_dir = agent_dir / "pilot_traces"
+        traces_dir.mkdir(parents=True, exist_ok=True)
+        (agent_dir / "pilot_policy.toml").write_text(
+            "[general]\nname = \"linux-pilot\"\n",
+            encoding="utf-8",
+        )
+        (traces_dir / "trace-1.json").write_text(
+            json.dumps({"status": "ok"}, indent=2),
+            encoding="utf-8",
+        )
+        export_store = MemoryStore(export_db)
+        try:
+            export_store.record_task(
+                "Bring up Linux agent",
+                status="open",
+                area="execution",
+            )
+            manager = ProjectHandoffManager(export_store, workspace_root=workspace)
+            report = manager.create_bundle()
+        finally:
+            export_store.close()
+
+        bundle_path = Path(report.bundle_path)
+        self.assertTrue(bundle_path.exists())
+        self.assertTrue(Path(report.manifest_path).exists())
+        self.assertTrue(Path(report.summary_path).exists())
+        with zipfile.ZipFile(bundle_path) as archive:
+            names = set(archive.namelist())
+        self.assertIn(".agent/agent_memory.sqlite3", names)
+        self.assertIn(".agent/pilot_policy.toml", names)
+        self.assertIn(".agent/pilot_traces/trace-1.json", names)
+        self.assertIn("_handoff/handoff_manifest.json", names)
+        self.assertIn("_handoff/HANDOFF.md", names)
+
+    def test_handoff_restore_restores_bundle_into_target_workspace(self) -> None:
+        source_workspace = self._make_workspace()
+        source_agent_dir = source_workspace / ".agent"
+        source_agent_dir.mkdir(parents=True, exist_ok=True)
+        export_db = source_agent_dir / "agent_memory.sqlite3"
+        (source_agent_dir / "pilot_policy.toml").write_text(
+            "[general]\nname = \"linux-pilot\"\n",
+            encoding="utf-8",
+        )
+        export_store = MemoryStore(export_db)
+        try:
+            export_store.remember(
+                MemoryDraft(
+                    kind="constraint",
+                    subject="runtime",
+                    content="The agent should run locally on the Linux box.",
+                )
+            )
+            bundle_report = ProjectHandoffManager(
+                export_store,
+                workspace_root=source_workspace,
+            ).create_bundle(include_traces=False)
+        finally:
+            export_store.close()
+
+        target_workspace = self._make_workspace()
+        (target_workspace / "pyproject.toml").write_text(
+            "[project]\nname = \"target\"\nversion = \"0.0.1\"\n",
+            encoding="utf-8",
+        )
+        restore_report = ProjectHandoffManager(
+            self.store,
+            workspace_root=target_workspace,
+        ).restore_bundle(Path(bundle_report.bundle_path))
+
+        restored_db = target_workspace / ".agent" / "agent_memory.sqlite3"
+        self.assertTrue(restored_db.exists())
+        self.assertTrue((target_workspace / ".agent" / "pilot_policy.toml").exists())
+        self.assertIn(".agent/agent_memory.sqlite3", restore_report.restored_files)
+        restored_store = MemoryStore(restored_db)
+        try:
+            results = restored_store.search("Linux box", limit=3)
+        finally:
+            restored_store.close()
+        self.assertTrue(results)
+        self.assertIn("Linux box", results[0].memory.content)
+
+    def test_patch_run_args_accept_utf8_bom_spec_file(self) -> None:
+        spec_path = self.temp_root / f"{uuid.uuid4().hex}_patch_spec.json"
+        self.extra_paths.append(spec_path)
+        spec_path.write_text(
+            "\ufeff"
+            + json.dumps(
+                {
+                    "operations": [
+                        {
+                            "operation": "replace_text",
+                            "path": "README.md",
+                            "find_text": "Memory-First Agent",
+                            "text": "Memory-First Agent",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        operations, validation_commands, apply_on_success, task_title = _resolve_patch_run_args(
+            Namespace(
+                spec_file=spec_path,
+                file_op=None,
+                file_path=None,
+                file_text=None,
+                find_text=None,
+                symbol_name=None,
+                replace_all=False,
+                validate=None,
+                apply_on_success=False,
+                task_title=None,
+            )
+        )
+
+        self.assertEqual(len(operations), 1)
+        self.assertEqual(operations[0].operation, "replace_text")
+        self.assertIsNone(validation_commands)
+        self.assertFalse(apply_on_success)
+        self.assertIsNone(task_title)
+
+    def test_patch_runner_applies_multi_file_python_symbol_batch(self) -> None:
+        self._record_green_baseline()
+        workspace = self._make_workspace()
+        module_a = workspace / "module_a.py"
+        module_b = workspace / "module_b.py"
+        module_a.write_text(
+            "def greet() -> str:\n"
+            "    return 'old-a'\n",
+            encoding="utf-8",
+        )
+        module_b.write_text(
+            "class Greeter:\n"
+            "    def speak(self) -> str:\n"
+            "        return 'old-b'\n",
+            encoding="utf-8",
+        )
+
+        def fake_runner(argv, cwd, capture_output, text, timeout, shell):
+            self.assertFalse(shell)
+            if argv[:3] == ["python", "-m", "memory_agent.cli"]:
+                payload = {
+                    "passed": True,
+                    "score": 1.0,
+                    "scenario_results": [
+                        {
+                            "name": "candidate",
+                            "description": "Candidate eval passed.",
+                            "passed": True,
+                            "score": 1.0,
+                            "checks": [
+                                {
+                                    "name": "candidate-check",
+                                    "passed": True,
+                                    "details": "All checks passed.",
+                                }
+                            ],
+                        }
+                    ],
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        runner = WorkspacePatchRunner(
+            self.store,
+            workspace_root=workspace,
+            shell_runner=fake_runner,
+        )
+        report = runner.run(
+            "multi file symbol patch",
+            operations=[
+                PatchOperation(
+                    operation="replace_python_function",
+                    path="module_a.py",
+                    symbol_name="greet",
+                    text="def greet() -> str:\n    return 'new-a'\n",
+                ),
+                PatchOperation(
+                    operation="replace_python_class",
+                    path="module_b.py",
+                    symbol_name="Greeter",
+                    text=(
+                        "class Greeter:\n"
+                        "    def speak(self) -> str:\n"
+                        "        return 'new-b'\n"
+                    ),
+                ),
+            ],
+            apply_on_success=True,
+        )
+
+        self.assertEqual(report.status, "applied")
+        self.assertEqual(sorted(report.changed_files), ["module_a.py", "module_b.py"])
+        self.assertIn("new-a", module_a.read_text(encoding="utf-8"))
+        self.assertIn("new-b", module_b.read_text(encoding="utf-8"))
+
+    def test_patch_runner_applies_python_delete_and_rename_batch(self) -> None:
+        self._record_green_baseline()
+        workspace = self._make_workspace()
+        module = workspace / "module_ops.py"
+        module.write_text(
+            "def helper() -> str:\n"
+            "    return 'helper'\n\n"
+            "def greet() -> str:\n"
+            "    return helper()\n\n"
+            "value = greet()\n",
+            encoding="utf-8",
+        )
+
+        def fake_runner(argv, cwd, capture_output, text, timeout, shell):
+            self.assertFalse(shell)
+            if argv[:3] == ["python", "-m", "memory_agent.cli"]:
+                payload = {
+                    "passed": True,
+                    "score": 1.0,
+                    "scenario_results": [
+                        {
+                            "name": "candidate",
+                            "description": "Candidate eval passed.",
+                            "passed": True,
+                            "score": 1.0,
+                            "checks": [
+                                {
+                                    "name": "candidate-check",
+                                    "passed": True,
+                                    "details": "All checks passed.",
+                                }
+                            ],
+                        }
+                    ],
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        runner = WorkspacePatchRunner(
+            self.store,
+            workspace_root=workspace,
+            shell_runner=fake_runner,
+        )
+        report = runner.run(
+            "delete and rename python symbols",
+            operations=[
+                PatchOperation(
+                    operation="replace_python_function",
+                    path="module_ops.py",
+                    symbol_name="greet",
+                    text="def greet() -> str:\n    return 'hello'\n",
+                ),
+                PatchOperation(
+                    operation="delete_python_symbol",
+                    path="module_ops.py",
+                    symbol_name="helper",
+                ),
+                PatchOperation(
+                    operation="rename_python_identifier",
+                    path="module_ops.py",
+                    symbol_name="greet",
+                    text="salute",
+                ),
+            ],
+            apply_on_success=True,
+        )
+
+        self.assertEqual(report.status, "applied")
+        updated = module.read_text(encoding="utf-8")
+        self.assertNotIn("def helper()", updated)
+        self.assertIn("def salute()", updated)
+        self.assertIn("value = salute()", updated)
+
+    def test_patch_runner_applies_import_and_method_refactor_batch(self) -> None:
+        self._record_green_baseline()
+        workspace = self._make_workspace()
+        module = workspace / "module_refactor.py"
+        module.write_text(
+            "\"\"\"Refactor target.\"\"\"\n\n"
+            "from __future__ import annotations\n\n"
+            "class Greeter:\n"
+            "    def speak(self) -> str:\n"
+            "        return 'hello'\n\n"
+            "greeter = Greeter()\n"
+            "VALUE = greeter.speak()\n",
+            encoding="utf-8",
+        )
+
+        def fake_runner(argv, cwd, capture_output, text, timeout, shell):
+            self.assertFalse(shell)
+            if argv[:3] == ["python", "-m", "memory_agent.cli"]:
+                payload = {
+                    "passed": True,
+                    "score": 1.0,
+                    "scenario_results": [
+                        {
+                            "name": "candidate",
+                            "description": "Candidate eval passed.",
+                            "passed": True,
+                            "score": 1.0,
+                            "checks": [
+                                {
+                                    "name": "candidate-check",
+                                    "passed": True,
+                                    "details": "All checks passed.",
+                                }
+                            ],
+                        }
+                    ],
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        runner = WorkspacePatchRunner(
+            self.store,
+            workspace_root=workspace,
+            shell_runner=fake_runner,
+        )
+        report = runner.run(
+            "import and method refactor batch",
+            operations=[
+                PatchOperation(
+                    operation="add_python_import",
+                    path="module_refactor.py",
+                    text="from pathlib import Path",
+                ),
+                PatchOperation(
+                    operation="rename_python_method",
+                    path="module_refactor.py",
+                    symbol_name="Greeter.speak",
+                    text="salute",
+                ),
+            ],
+            apply_on_success=True,
+        )
+
+        self.assertEqual(report.status, "applied")
+        updated = module.read_text(encoding="utf-8")
+        self.assertIn("from pathlib import Path", updated)
+        self.assertIn("def salute(self)", updated)
+        self.assertIn("VALUE = greeter.salute()", updated)
+
+    def test_patch_runner_applies_signature_refactor_batch(self) -> None:
+        self._record_green_baseline()
+        workspace = self._make_workspace()
+        module = workspace / "module_signature.py"
+        module.write_text(
+            "def greet(name: str) -> str:\n"
+            "    return name.upper()\n\n"
+            "value = greet('sam')\n",
+            encoding="utf-8",
+        )
+
+        def fake_runner(argv, cwd, capture_output, text, timeout, shell):
+            self.assertFalse(shell)
+            if argv[:3] == ["python", "-m", "memory_agent.cli"]:
+                payload = {
+                    "passed": True,
+                    "score": 1.0,
+                    "scenario_results": [
+                        {
+                            "name": "candidate",
+                            "description": "Candidate eval passed.",
+                            "passed": True,
+                            "score": 1.0,
+                            "checks": [
+                                {
+                                    "name": "candidate-check",
+                                    "passed": True,
+                                    "details": "All checks passed.",
+                                }
+                            ],
+                        }
+                    ],
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        runner = WorkspacePatchRunner(
+            self.store,
+            workspace_root=workspace,
+            shell_runner=fake_runner,
+        )
+        report = runner.run(
+            "signature refactor batch",
+            operations=[
+                PatchOperation(
+                    operation="add_python_function_parameter",
+                    path="module_signature.py",
+                    symbol_name="greet",
+                    text=json.dumps(
+                        {
+                            "parameter_name": "excited",
+                            "call_argument": "True",
+                        }
+                    ),
+                )
+            ],
+            apply_on_success=True,
+        )
+
+        self.assertEqual(report.status, "applied")
+        updated = module.read_text(encoding="utf-8")
+        self.assertIn("def greet(name: str, excited)", updated)
+        self.assertIn("value = greet('sam', excited=True)", updated)
+
+    def test_patch_runner_applies_cross_import_rename_and_reports_multi_file_changes(self) -> None:
+        self._record_green_baseline()
+        workspace = self._make_workspace()
+        package = workspace / "pkgdemo"
+        package.mkdir(parents=True, exist_ok=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        source = package / "greeter.py"
+        consumer = workspace / "consumer.py"
+        module_consumer = workspace / "module_consumer.py"
+        source.write_text(
+            "def greet(name: str) -> str:\n"
+            "    return name.upper()\n",
+            encoding="utf-8",
+        )
+        consumer.write_text(
+            "from pkgdemo.greeter import greet\n"
+            "result = greet('zoe')\n",
+            encoding="utf-8",
+        )
+        module_consumer.write_text(
+            "import pkgdemo.greeter as greeter_mod\n"
+            "other = greeter_mod.greet('amy')\n",
+            encoding="utf-8",
+        )
+
+        def fake_runner(argv, cwd, capture_output, text, timeout, shell):
+            self.assertFalse(shell)
+            if argv[:3] == ["python", "-m", "memory_agent.cli"]:
+                payload = {
+                    "passed": True,
+                    "score": 1.0,
+                    "scenario_results": [
+                        {
+                            "name": "candidate",
+                            "description": "Candidate eval passed.",
+                            "passed": True,
+                            "score": 1.0,
+                            "checks": [
+                                {
+                                    "name": "candidate-check",
+                                    "passed": True,
+                                    "details": "All checks passed.",
+                                }
+                            ],
+                        }
+                    ],
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        runner = WorkspacePatchRunner(
+            self.store,
+            workspace_root=workspace,
+            shell_runner=fake_runner,
+        )
+        report = runner.run(
+            "cross import rename",
+            operations=[
+                PatchOperation(
+                    operation="rename_python_export_across_imports",
+                    path="pkgdemo/greeter.py",
+                    symbol_name="greet",
+                    text="salute",
+                )
+            ],
+            apply_on_success=True,
+        )
+
+        self.assertEqual(report.status, "applied")
+        self.assertEqual(
+            sorted(report.changed_files),
+            ["consumer.py", "module_consumer.py", "pkgdemo/greeter.py"],
+        )
+        self.assertIn("def salute(name: str)", source.read_text(encoding="utf-8"))
+        self.assertIn("import salute", consumer.read_text(encoding="utf-8"))
+        self.assertIn("greeter_mod.salute('amy')", module_consumer.read_text(encoding="utf-8"))
+
+    def test_patch_runner_moves_python_export_to_module_and_reports_changed_files(self) -> None:
+        self._record_green_baseline()
+        workspace = self._make_workspace()
+        package = workspace / "pkgmove"
+        package.mkdir(parents=True, exist_ok=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        source = package / "legacy.py"
+        destination = package / "core.py"
+        consumer = workspace / "consumer.py"
+        source.write_text(
+            "from pathlib import Path\n\n"
+            "def greet(name: str) -> str:\n"
+            "    return Path(name).name.upper()\n",
+            encoding="utf-8",
+        )
+        consumer.write_text(
+            "from pkgmove.legacy import greet\n"
+            "value = greet('sam.txt')\n",
+            encoding="utf-8",
+        )
+
+        def fake_runner(argv, cwd, capture_output, text, timeout, shell):
+            self.assertFalse(shell)
+            if argv[:3] == ["python", "-m", "memory_agent.cli"]:
+                payload = {
+                    "passed": True,
+                    "score": 1.0,
+                    "scenario_results": [
+                        {
+                            "name": "candidate",
+                            "description": "Candidate eval passed.",
+                            "passed": True,
+                            "score": 1.0,
+                            "checks": [
+                                {
+                                    "name": "candidate-check",
+                                    "passed": True,
+                                    "details": "All checks passed.",
+                                }
+                            ],
+                        }
+                    ],
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        runner = WorkspacePatchRunner(
+            self.store,
+            workspace_root=workspace,
+            shell_runner=fake_runner,
+        )
+        report = runner.run(
+            "move export to module",
+            operations=[
+                PatchOperation(
+                    operation="move_python_export_to_module",
+                    path="pkgmove/legacy.py",
+                    symbol_name="greet",
+                    text=json.dumps(
+                        {
+                            "destination_path": "pkgmove/core.py",
+                        }
+                    ),
+                )
+            ],
+            apply_on_success=True,
+        )
+
+        self.assertEqual(report.status, "applied")
+        self.assertEqual(
+            sorted(report.changed_files),
+            ["consumer.py", "pkgmove/core.py", "pkgmove/legacy.py"],
+        )
+        self.assertIn("from pathlib import Path", destination.read_text(encoding="utf-8"))
+        self.assertIn("def greet(name: str)", destination.read_text(encoding="utf-8"))
+        self.assertIn("from pkgmove.core import greet", source.read_text(encoding="utf-8"))
+        self.assertIn("from pkgmove.core import greet", consumer.read_text(encoding="utf-8"))
+
+    def test_patch_runner_rejects_regressing_candidate_without_touching_workspace(self) -> None:
+        self._record_green_baseline()
+        workspace = self._make_workspace()
+        target = workspace / "target.txt"
+        target.write_text("alpha\nbeta\n", encoding="utf-8")
+
+        def fake_runner(argv, cwd, capture_output, text, timeout, shell):
+            self.assertFalse(shell)
+            if argv[:3] == ["python", "-m", "memory_agent.cli"]:
+                payload = {
+                    "passed": False,
+                    "score": 0.5,
+                    "scenario_results": [
+                        {
+                            "name": "candidate",
+                            "description": "Candidate eval failed.",
+                            "passed": False,
+                            "score": 0.0,
+                            "checks": [
+                                {
+                                    "name": "candidate-check",
+                                    "passed": False,
+                                    "details": "Regression detected.",
+                                }
+                            ],
+                        }
+                    ],
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        runner = WorkspacePatchRunner(
+            self.store,
+            workspace_root=workspace,
+            shell_runner=fake_runner,
+        )
+        report = runner.run(
+            "reject target update",
+            operations=[
+                PatchOperation(
+                    operation="replace_text",
+                    path="target.txt",
+                    find_text="beta",
+                    text="gamma",
+                )
+            ],
+            apply_on_success=True,
+        )
+
+        self.assertEqual(report.status, "rejected")
+        self.assertFalse(report.applied)
+        self.assertEqual(target.read_text(encoding="utf-8"), "alpha\nbeta\n")
+        self.assertIsNotNone(report.candidate_evaluation)
+        self.assertEqual(report.candidate_evaluation["score"], 0.5)
+        self.assertEqual(report.validations[-1].kind, "evaluation")
+        latest_patch_run = self.store.latest_patch_run()
+        self.assertIsNotNone(latest_patch_run)
+        self.assertEqual(latest_patch_run["status"], "rejected")
+        self.assertEqual(latest_patch_run["candidate_score"], 0.5)
+
+    def test_patch_runner_rejects_invalid_python_symbol_patch_before_validation(self) -> None:
+        self._record_green_baseline()
+        workspace = self._make_workspace()
+        target = workspace / "module_bad.py"
+        target.write_text(
+            "def greet() -> str:\n"
+            "    return 'hello'\n",
+            encoding="utf-8",
+        )
+
+        runner = WorkspacePatchRunner(
+            self.store,
+            workspace_root=workspace,
+        )
+        report = runner.run(
+            "reject invalid symbol patch",
+            operations=[
+                PatchOperation(
+                    operation="replace_python_function",
+                    path="module_bad.py",
+                    symbol_name="greet",
+                    text="def greet(\n    return 'broken'\n",
+                )
+            ],
+            apply_on_success=True,
+        )
+
+        self.assertEqual(report.status, "rejected")
+        self.assertIn("updated_python_parse_error", report.rejection_reason)
+        self.assertEqual(report.validations, [])
+        self.assertEqual(
+            target.read_text(encoding="utf-8"),
+            "def greet() -> str:\n    return 'hello'\n",
+        )
+
+    def test_improvement_engine_runs_patch_candidate_and_completes_task(self) -> None:
+        self._record_green_baseline()
+        workspace = self._make_workspace()
+        target = workspace / "target.txt"
+        target.write_text("alpha\nbeta\n", encoding="utf-8")
+        self.store.record_task(
+            "Apply code-aware patching prototype",
+            status="open",
+            area="self_improvement",
+        )
+
+        def fake_runner(argv, cwd, capture_output, text, timeout, shell):
+            self.assertFalse(shell)
+            if argv[:3] == ["python", "-m", "memory_agent.cli"]:
+                payload = {
+                    "passed": True,
+                    "score": 1.0,
+                    "scenario_results": [
+                        {
+                            "name": "candidate",
+                            "description": "Candidate eval passed.",
+                            "passed": True,
+                            "score": 1.0,
+                            "checks": [
+                                {
+                                    "name": "candidate-check",
+                                    "passed": True,
+                                    "details": "All checks passed.",
+                                }
+                            ],
+                        }
+                    ],
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        engine = MemoryImprovementEngine(self.store, evaluator=object())
+        report = engine.run_patch_candidate(
+            "code-aware patching prototype",
+            operations=[
+                PatchOperation(
+                    operation="replace_text",
+                    path="target.txt",
+                    find_text="beta",
+                    text="delta",
+                )
+            ],
+            apply_on_success=True,
+            task_title="Apply code-aware patching prototype",
+            patch_runner=WorkspacePatchRunner(
+                self.store,
+                workspace_root=workspace,
+                shell_runner=fake_runner,
+            ),
+        )
+
+        self.assertEqual(report.status, "applied")
+        self.assertIsNotNone(report.task_update)
+        self.assertEqual(report.task_update.metadata.get("status"), "done")
+        self.assertIsNone(
+            self.store.find_active_task(
+                "Apply code-aware patching prototype",
+                area="self_improvement",
+            )
+        )
+        self.assertEqual(target.read_text(encoding="utf-8"), "alpha\ndelta\n")
+
+    def test_agent_respond_uses_model_with_memory_and_plan_context(self) -> None:
+        self.store.record_task(
+            "Build task graph maintenance",
+            status="blocked",
+            area="execution",
+            blocked_by=["Finish entity resolution"],
+            due_date="2026-04-02",
+        )
+
+        captured_messages = []
+
+        class FakeModelAdapter:
+            @property
+            def enabled(self):
+                return True
+
+            def status(self):
+                return {
+                    "enabled": True,
+                    "backend": "fake",
+                    "model": "fake-main",
+                }
+
+            def chat(self, messages):
+                captured_messages.extend(messages)
+                return ModelResponse(
+                    content="We should clear the blocker on Build task graph maintenance first.",
+                    model="fake-main",
+                )
+
+        agent = MemoryFirstAgent(self.store, model_adapter=FakeModelAdapter())
+        report = agent.respond("What should I do next?")
+
+        self.assertIsNone(report.error)
+        self.assertEqual(report.assistant_message, "We should clear the blocker on Build task graph maintenance first.")
+        self.assertIsNotNone(report.assistant_event_id)
+        self.assertEqual(len(captured_messages), 2)
+        self.assertEqual(captured_messages[0].role, "system")
+        self.assertIn("Build task graph maintenance", captured_messages[0].content)
+        self.assertIn("Planner state:", captured_messages[0].content)
+        events = self.store.recent_events(limit=2)
+        self.assertEqual(events[-1].role, "assistant")
+        self.assertIn("clear the blocker", events[-1].content.lower())
+
+    def test_agent_decide_executes_valid_structured_plan_option(self) -> None:
+        self.store.record_task(
+            "Ship overdue ready memory loop",
+            status="open",
+            area="execution",
+            due_date="2000-01-01",
+        )
+
+        class FakeModelAdapter:
+            @property
+            def enabled(self):
+                return True
+
+            def status(self):
+                return {
+                    "enabled": True,
+                    "backend": "fake",
+                    "model": "fake-main",
+                }
+
+            def chat(self, messages):
+                return ModelResponse(
+                    content=(
+                        '{"assistant_message":"I am starting the overdue ready task now.",'
+                        '"action":{"type":"execute_plan_action","option_id":"A1",'
+                        '"rationale":"The top recommendation clearly fits the request."}}'
+                    ),
+                    model="fake-main",
+                )
+
+        agent = MemoryFirstAgent(self.store, model_adapter=FakeModelAdapter())
+        report = agent.decide("What should I do next?")
+
+        self.assertIsNone(report.error)
+        self.assertIsNotNone(report.model_action)
+        self.assertEqual(report.model_action.action_type, "execute_plan_action")
+        self.assertIsNotNone(report.model_action.chosen_option)
+        self.assertEqual(report.model_action.chosen_option.option_id, "A1")
+        self.assertIsNotNone(report.execution_result)
+        self.assertEqual(report.execution_result.executed_kind, "work_task")
+        self.assertEqual(report.execution_result.status, "success")
+        self.assertEqual(report.execution_result.task_update.metadata.get("status"), "in_progress")
+        self.assertEqual(report.assistant_message, "I am starting the overdue ready task now.")
+        self.assertIsNotNone(report.after_plan)
+        events = self.store.recent_events(limit=2)
+        self.assertEqual(events[-1].role, "assistant")
+        self.assertIn("starting the overdue ready task", events[-1].content.lower())
+
+    def test_agent_decide_falls_back_to_reply_when_option_id_is_invalid(self) -> None:
+        self.store.record_task(
+            "Ship overdue ready memory loop",
+            status="open",
+            area="execution",
+            due_date="2000-01-01",
+        )
+
+        class FakeModelAdapter:
+            @property
+            def enabled(self):
+                return True
+
+            def status(self):
+                return {
+                    "enabled": True,
+                    "backend": "fake",
+                    "model": "fake-main",
+                }
+
+            def chat(self, messages):
+                return ModelResponse(
+                    content=(
+                        '{"assistant_message":"The action proposal was invalid, so here is the'
+                        ' status update instead.","action":{"type":"execute_plan_action",'
+                        '"option_id":"A99"}}'
+                    ),
+                    model="fake-main",
+                )
+
+        agent = MemoryFirstAgent(self.store, model_adapter=FakeModelAdapter())
+        report = agent.decide("What should I do next?")
+
+        self.assertIsNone(report.error)
+        self.assertIsNotNone(report.model_action)
+        self.assertEqual(report.model_action.action_type, "reply_only")
+        self.assertTrue(report.model_action.fallback_to_reply)
+        self.assertEqual(report.model_action.validation_error, "unknown_option_id=A99")
+        self.assertIsNone(report.execution_result)
+        self.assertEqual(
+            report.assistant_message,
+            "The action proposal was invalid, so here is the status update instead.",
+        )
+        events = self.store.recent_events(limit=2)
+        self.assertEqual(events[-1].role, "assistant")
+        self.assertIn("status update instead", events[-1].content.lower())
+
+    def test_ollama_chat_adapter_parses_response_payload(self) -> None:
+        payloads = []
+
+        def fake_fetch(payload):
+            payloads.append(payload)
+            return {
+                "model": "qwen3:14b",
+                "message": {
+                    "role": "assistant",
+                    "content": "Use SQLite as the source of truth.",
+                },
+                "done_reason": "stop",
+                "prompt_eval_count": 123,
+                "eval_count": 45,
+            }
+
+        adapter = OllamaChatAdapter(
+            model="qwen3:14b",
+            fetch_response=fake_fetch,
+        )
+        response = adapter.chat(
+            [
+                type("Msg", (), {"role": "system", "content": "Be helpful."})(),
+                type("Msg", (), {"role": "user", "content": "What storage should we use?"})(),
+            ]
+        )
+
+        self.assertEqual(response.content, "Use SQLite as the source of truth.")
+        self.assertEqual(response.model, "qwen3:14b")
+        self.assertEqual(response.done_reason, "stop")
+        self.assertEqual(response.prompt_eval_count, 123)
+        self.assertEqual(response.eval_count, 45)
+        self.assertEqual(payloads[0]["model"], "qwen3:14b")
+        self.assertFalse(payloads[0]["stream"])
+
+    def test_reflect_recent_creates_source_linked_summary(self) -> None:
+        cost = self.store.remember(
+            MemoryDraft(
+                kind="preference",
+                subject="optimization",
+                content="Optimize the agent for low ongoing cost.",
+                tags=["cost", "optimization"],
+                importance=0.95,
+                confidence=0.9,
+            )
+        )
+        speed = self.store.remember(
+            MemoryDraft(
+                kind="preference",
+                subject="optimization",
+                content="Optimize the agent for efficient, low-latency operation.",
+                tags=["performance", "optimization"],
+                importance=0.92,
+                confidence=0.9,
+            )
+        )
+        reflections = self.store.reflect_recent(limit=10, max_reflections=3)
+        optimization_reflection = next(
+            reflection for reflection in reflections if reflection.subject == "optimization"
+        )
+        self.assertEqual(optimization_reflection.layer, "reflection")
+        sources = self.store.get_memory_sources(optimization_reflection.id)
+        source_memory_ids = {
+            source.source_id for source in sources if source.source_type == "memory"
+        }
+        self.assertTrue({cost.id, speed.id}.issubset(source_memory_ids))
+
+    def test_revise_memory_supersedes_old_version(self) -> None:
+        original = self.store.remember(
+            MemoryDraft(
+                kind="constraint",
+                subject="runtime",
+                content="The agent should run locally on the user's main PC.",
+                tags=["runtime", "local"],
+                importance=0.95,
+                confidence=0.95,
+            )
+        )
+        revised = self.store.revise_memory(
+            original.id,
+            "The agent should run locally on the user's main PC and laptop.",
+        )
+        original_after = self.store.get_memory(original.id)
+        self.assertIsNotNone(original_after.archived_at)
+        edges = self.store.get_memory_edges(revised.id, direction="outgoing")
+        self.assertTrue(
+            any(edge.edge_type == "supersedes" and edge.to_memory_id == original.id for edge in edges)
+        )
+        results = self.store.search("laptop", limit=3)
+        self.assertEqual(results[0].memory.id, revised.id)
+
+    def test_contradiction_detection_links_conflicting_memories(self) -> None:
+        local = self.store.remember(
+            MemoryDraft(
+                kind="constraint",
+                subject="runtime",
+                content="The agent should run locally on the user's main PC.",
+                tags=["runtime", "local"],
+                importance=0.95,
+                confidence=0.95,
+            )
+        )
+        cloud = self.store.remember(
+            MemoryDraft(
+                kind="constraint",
+                subject="runtime",
+                content="The agent should run in the cloud instead of locally.",
+                tags=["runtime", "cloud"],
+                importance=0.9,
+                confidence=0.9,
+            )
+        )
+        edges = self.store.get_memory_edges(cloud.id, direction="outgoing")
+        self.assertTrue(
+            any(edge.edge_type == "contradicts" and edge.to_memory_id == local.id for edge in edges)
+        )
+        context = self.store.build_context("cloud runtime", memory_limit=3, recent_event_count=1)
+        self.assertTrue(any(bundle.contradictions for bundle in context.bundles))
+
+    def test_maintenance_runs_due_tasks_and_tracks_state(self) -> None:
+        self.store.remember(
+            MemoryDraft(
+                kind="preference",
+                subject="optimization",
+                content="Optimize the agent for low ongoing cost.",
+                tags=["cost", "optimization"],
+                importance=0.95,
+                confidence=0.9,
+            )
+        )
+        self.store.remember(
+            MemoryDraft(
+                kind="preference",
+                subject="optimization",
+                content="Optimize the agent for efficient, low-latency operation.",
+                tags=["performance", "optimization"],
+                importance=0.92,
+                confidence=0.9,
+            )
+        )
+        report = self.store.run_maintenance()
+        self.assertIn("contradiction_scan", report["executed"])
+        self.assertIn("reflection", report["executed"])
+        self.assertIn("profile", report["executed"])
+        stats = self.store.stats()
+        self.assertIn("maintenance", stats)
+        self.assertFalse(stats["maintenance"]["reflection"]["due"])
+
+    def test_optional_semantic_reranker_can_reorder_candidates(self) -> None:
+        self.store.remember(
+            MemoryDraft(
+                kind="constraint",
+                subject="runtime",
+                content="Local desktop agent for offline work.",
+                tags=["runtime", "local"],
+                importance=0.85,
+                confidence=0.9,
+            )
+        )
+        self.store.remember(
+            MemoryDraft(
+                kind="constraint",
+                subject="runtime",
+                content="Cloud server agent for distributed work.",
+                tags=["runtime", "cloud"],
+                importance=0.9,
+                confidence=0.9,
+            )
+        )
+
+        def fake_fetch(texts: list[str]) -> list[list[float]]:
+            embeddings: list[list[float]] = []
+            for text in texts:
+                lowered = text.lower()
+                if lowered == "agent":
+                    embeddings.append([1.0, 0.0])
+                elif "desktop" in lowered or "offline" in lowered:
+                    embeddings.append([1.0, 0.0])
+                elif "cloud" in lowered or "server" in lowered:
+                    embeddings.append([0.0, 1.0])
+                else:
+                    embeddings.append([0.5, 0.5])
+            return embeddings
+
+        self.store.reranker = OptionalSemanticReranker(
+            self.store.connection,
+            model="fake-embed",
+            fetch_embeddings=fake_fetch,
+        )
+        results = self.store.search("agent", limit=2)
+        self.assertEqual(results[0].memory.content, "Local desktop agent for offline work.")
+        self.assertTrue(any(reason.startswith("semantic=") for reason in results[0].reasons))
+        status = self.store.reranker.status()
+        self.assertTrue(status["enabled"])
+        self.assertEqual(status["cached_vectors"], 3)
+
+    def test_domain_aware_profile_summarizes_decisions_tasks_and_tools(self) -> None:
+        self.store.record_decision(
+            "architecture",
+            "Use SQLite as the source of truth for memory storage",
+            rationale="It is cheap and local-first",
+        )
+        self.store.record_task(
+            "Add contradiction handling",
+            status="open",
+            area="architecture",
+        )
+        self.store.record_tool_outcome(
+            "tests",
+            "All verification checks passed",
+            subject="architecture",
+        )
+        profiles = self.store.synthesize_profiles(limit=20, max_profiles=5)
+        architecture_profile = next(
+            profile for profile in profiles if profile.subject == "architecture"
+        )
+        self.assertIn("decisions:", architecture_profile.content.lower())
+        self.assertIn("tasks:", architecture_profile.content.lower())
+        self.assertIn("tool outcomes:", architecture_profile.content.lower())
+
+    def test_builtin_evaluation_suite_passes(self) -> None:
+        report = MemoryEvaluator(Path.cwd()).run_builtin_suite()
+        self.assertTrue(report.passed)
+        self.assertGreaterEqual(report.score, 0.99)
+
+    def test_synthesize_profiles_creates_stable_long_term_memory(self) -> None:
+        self.store.remember(
+            MemoryDraft(
+                kind="preference",
+                subject="optimization",
+                content="Optimize the agent for low ongoing cost.",
+                tags=["cost", "optimization"],
+                importance=0.95,
+                confidence=0.9,
+            )
+        )
+        self.store.remember(
+            MemoryDraft(
+                kind="preference",
+                subject="optimization",
+                content="Optimize the agent for efficient, low-latency operation.",
+                tags=["performance", "optimization"],
+                importance=0.92,
+                confidence=0.9,
+            )
+        )
+        self.store.reflect_recent(limit=10, max_reflections=3)
+        profiles = self.store.synthesize_profiles(limit=20, max_profiles=3)
+        optimization_profile = next(
+            profile for profile in profiles if profile.subject == "optimization"
+        )
+        self.assertEqual(optimization_profile.layer, "profile")
+        edges = self.store.get_memory_edges(optimization_profile.id, direction="outgoing")
+        self.assertTrue(any(edge.edge_type == "abstracts" for edge in edges))
+        results = self.store.search("optimization cost latency", limit=3, layers=("profile",))
+        self.assertEqual(results[0].memory.id, optimization_profile.id)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,8 @@
+.agent/
+.eval_tmp/
+.test_tmp/
+tmp*/
+__pycache__/
+*.pyc
+.venv/
+venv/
