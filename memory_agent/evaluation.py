@@ -13,6 +13,7 @@ from .memory import MemoryStore
 from .model_adapter import ModelResponse
 from .models import ContextWindow, MemoryDraft, SearchResult
 from .planner import MemoryPlanner
+from .python_runtime import preferred_python_command
 
 
 @dataclass(slots=True)
@@ -1393,7 +1394,7 @@ class MemoryEvaluator:
                             "title": "Check CLI help",
                             "status": "open",
                             "area": "execution",
-                            "command": "python -m memory_agent.cli --help",
+                            "command": f"{preferred_python_command()} -m memory_agent.cli --help",
                             "complete_on_success": True,
                         },
                     ),

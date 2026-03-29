@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import difflib
 import json
-import os
 import shutil
 import subprocess
 import uuid
@@ -19,6 +18,7 @@ from .config import (
 from .file_adapter import FileOperationResult, WorkspaceFileAdapter
 from .memory import MemoryStore
 from .models import MemoryRecord
+from .python_runtime import available_python_commands, preferred_python_command
 from .shell_adapter import GuardedShellAdapter, ShellExecutionResult
 
 PATCH_IGNORE_NAMES = {
@@ -717,50 +717,57 @@ class WorkspacePatchRunner:
         shell_adapter: GuardedShellAdapter,
         suite_name: str,
     ) -> tuple[PatchValidationResult, dict[str, Any] | None]:
+        failures: list[str] = []
+        last_shell_result: ShellExecutionResult | None = None
+
+        for python_command in available_python_commands():
+            command = (
+                f"{python_command} -m memory_agent.cli "
+                "--db .agent/patch_candidate.sqlite3 evaluate --json"
+            )
+            shell_result = shell_adapter.execute(command)
+            last_shell_result = shell_result
+            if shell_result.status != "success":
+                failures.append(
+                    f"{python_command}:{shell_result.reason or 'candidate_evaluation_command_failed'}"
+                )
+                continue
+            try:
+                payload = json.loads(shell_result.stdout)
+            except json.JSONDecodeError as exc:
+                failures.append(f"{python_command}:candidate_evaluation_parse_error:{exc}")
+                continue
+
+            evaluation = self._normalize_evaluation_payload(payload, suite_name=suite_name)
+            score = float(evaluation.get("score", 0.0) or 0.0)
+            scenarios_passed = int(evaluation.get("scenarios_passed", 0) or 0)
+            scenarios_total = int(evaluation.get("scenarios_total", 0) or 0)
+            details = f"score={score:.1%}; scenarios={scenarios_passed}/{scenarios_total}"
+            validation = PatchValidationResult(
+                kind="evaluation",
+                name=f"evaluate:{suite_name}",
+                status="success" if bool(evaluation.get("passed")) else "error",
+                passed=bool(evaluation.get("passed")),
+                details=details,
+                command_text=command,
+                result={"shell": shell_result.to_dict(), "evaluation": evaluation},
+            )
+            return validation, evaluation
+
         command = (
-            f"{self._default_python_command()} -m memory_agent.cli "
+            f"{preferred_python_command()} -m memory_agent.cli "
             "--db .agent/patch_candidate.sqlite3 evaluate --json"
         )
-        shell_result = shell_adapter.execute(command)
-        if shell_result.status != "success":
-            validation = PatchValidationResult(
-                kind="evaluation",
-                name=f"evaluate:{suite_name}",
-                status=shell_result.status,
-                passed=False,
-                details=shell_result.reason or "candidate_evaluation_command_failed",
-                command_text=command,
-                result={"shell": shell_result.to_dict()},
-            )
-            return validation, None
-        try:
-            payload = json.loads(shell_result.stdout)
-        except json.JSONDecodeError as exc:
-            validation = PatchValidationResult(
-                kind="evaluation",
-                name=f"evaluate:{suite_name}",
-                status="error",
-                passed=False,
-                details=f"candidate_evaluation_parse_error:{exc}",
-                command_text=command,
-                result={"shell": shell_result.to_dict()},
-            )
-            return validation, None
-        evaluation = self._normalize_evaluation_payload(payload, suite_name=suite_name)
-        score = float(evaluation.get("score", 0.0) or 0.0)
-        scenarios_passed = int(evaluation.get("scenarios_passed", 0) or 0)
-        scenarios_total = int(evaluation.get("scenarios_total", 0) or 0)
-        details = f"score={score:.1%}; scenarios={scenarios_passed}/{scenarios_total}"
         validation = PatchValidationResult(
             kind="evaluation",
             name=f"evaluate:{suite_name}",
-            status="success" if bool(evaluation.get("passed")) else "error",
-            passed=bool(evaluation.get("passed")),
-            details=details,
+            status=last_shell_result.status if last_shell_result is not None else "error",
+            passed=False,
+            details="; ".join(failures) if failures else "candidate_evaluation_command_failed",
             command_text=command,
-            result={"shell": shell_result.to_dict(), "evaluation": evaluation},
+            result={"shell": last_shell_result.to_dict()} if last_shell_result is not None else {},
         )
-        return validation, evaluation
+        return validation, None
 
     def _normalize_evaluation_payload(
         self,
@@ -1371,7 +1378,7 @@ class WorkspacePatchRunner:
         return [f"{python_command} -m unittest discover -s tests -v"]
 
     def _default_python_command(self) -> str:
-        return "python" if os.name == "nt" else "python3"
+        return preferred_python_command()
 
     def _slugify(self, text: str) -> str:
         lowered = "".join(
