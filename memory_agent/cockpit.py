@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .agent import MemoryFirstAgent
 from .executor import ExecutionCycle, MemoryExecutor
+from .improvement import PilotHistoryReporter
 from .linux_runtime import LinuxPilotPolicy, LinuxPilotRuntime, PilotTurnReport
 from .memory import MemoryStore
 from .patch_runner import WorkspacePatchRunner
@@ -805,6 +806,23 @@ COCKPIT_HTML = """<!doctype html>
           </div>
         </div>
       `;
+      const trustedSignals = pilotPolicy.trusted_write_recommendations || [];
+      const trustedSignalCard = `
+        <div class="card">
+          <div class="eyebrow">Pilot history trust signals</div>
+          <div class="headline">${trustedSignals.length ? `${trustedSignals.length} repeated write pattern(s)` : "No repeated trust signals yet"}</div>
+          <div class="body">These come from recent pilot reviews that repeatedly stopped on the same low-risk single-file write.</div>
+          <div style="margin-top:12px; display:grid; gap:12px;">
+            ${trustedSignals.length ? trustedSignals.map((item) => `
+              <div class="card" style="padding:12px; border-radius:16px;">
+                <div class="headline" style="font-size:1rem;">${item.label}</div>
+                <div class="body" style="margin-top:6px;">Seen ${item.count} times in recent pilot reviews.</div>
+                <div class="body" style="margin-top:6px;">Operation: ${item.file_operation || "unknown"} · Path: ${item.file_path || "unknown"}</div>
+              </div>
+            `).join("") : `<div class="card" style="padding:12px; border-radius:16px;"><div class="body muted">No repeated low-risk write approval pattern has crossed the reporting threshold yet.</div></div>`}
+          </div>
+        </div>
+      `;
       const actionButtons = actions.length ? `
         <div class="card">
           <div class="eyebrow">Guided setup actions</div>
@@ -847,6 +865,7 @@ COCKPIT_HTML = """<!doctype html>
           <div class="body" style="margin-top:8px;">Icon: ${desktop.icon_installed ? "installed" : "missing"}</div>
         </div>
         ${policyCard}
+        ${trustedSignalCard}
         ${actionButtons}
       `;
       const rotate = document.getElementById("rotate-remote-token");
@@ -2298,6 +2317,18 @@ class CockpitService:
     def _pilot_policy_settings(self) -> dict[str, Any]:
         policy_status = self.pilot_policy.status()
         operations = list(policy_status.get("trusted_auto_approve_file_operations") or [])
+        history_report = PilotHistoryReporter(self.store).build(limit=12)
+        trusted_write_recommendations = [
+            {
+                "key": str(item.get("key") or ""),
+                "label": str(item.get("label") or ""),
+                "count": int(item.get("count") or 0),
+                "file_operation": str(item.get("file_operation") or ""),
+                "file_path": str(item.get("file_path") or ""),
+            }
+            for item in history_report.recurring_patterns
+            if str(item.get("kind") or "") == "trusted_write_candidate"
+        ]
         return {
             **policy_status,
             "policy_path": str(self.pilot_policy.resolved_policy_path()),
@@ -2308,6 +2339,7 @@ class CockpitService:
                 "replace_text",
                 "write_text",
             ],
+            "trusted_write_recommendations": trusted_write_recommendations,
         }
 
     def _execution_cycle_to_json(self, cycle: ExecutionCycle) -> dict[str, Any]:

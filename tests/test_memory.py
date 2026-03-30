@@ -1383,6 +1383,50 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertTrue(report.recurring_patterns)
         self.assertEqual(report.recurring_patterns[0]["kind"], "category")
 
+    def test_pilot_history_report_surfaces_trusted_write_candidates(self) -> None:
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        reviewer = PilotRunReviewer(self.store)
+        target = self.temp_root / f"{uuid.uuid4().hex}_pilot_trusted_candidate.txt"
+        self.extra_paths.append(target)
+        target.write_text("alpha\n", encoding="utf-8")
+        rel_path = str(target.relative_to(Path.cwd()))
+
+        for index in range(2):
+            trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+            self.extra_dirs.append(trace_dir)
+            policy.trace_dir = trace_dir
+            self.store.record_task(
+                f"Pilot trusted candidate {index}",
+                status="open",
+                area="execution",
+                file_operation="write_text",
+                file_path=rel_path,
+                file_text=f"beta {index}\n",
+                complete_on_success=True,
+            )
+            runtime = LinuxPilotRuntime(
+                self.store,
+                policy=policy,
+                patch_runner=self._make_runtime_patch_runner(),
+            )
+            run = runtime.run_session(
+                f"pilot trusted candidate {index}",
+                max_steps=2,
+                auto_approve=False,
+                use_model=False,
+            )
+            reviewer.review(run, promote_limit=0)
+
+        report = PilotHistoryReporter(self.store).build(limit=10)
+
+        trusted_patterns = [
+            item for item in report.recurring_patterns if item.get("kind") == "trusted_write_candidate"
+        ]
+        self.assertTrue(trusted_patterns)
+        self.assertEqual(trusted_patterns[0]["file_operation"], "write_text")
+        self.assertEqual(trusted_patterns[0]["file_path"], rel_path)
+        self.assertGreaterEqual(int(trusted_patterns[0]["count"] or 0), 2)
+
     def test_pilot_chat_prompts_and_executes_approved_turn(self) -> None:
         target = self.temp_root / f"{uuid.uuid4().hex}_pilot_chat.txt"
         self.extra_paths.append(target)
@@ -3783,6 +3827,65 @@ class MemoryStoreTests(unittest.TestCase):
         reloaded = LinuxPilotPolicy.load(workspace_root=workspace)
         self.assertEqual(reloaded.trusted_auto_approve_file_operations, {"append_text"})
         self.assertEqual(reloaded.trusted_auto_approve_required_successes, 4)
+
+    def test_cockpit_service_settings_include_trusted_write_recommendations(self) -> None:
+        workspace = self._make_workspace()
+        config_dir = self.temp_root / f"pilot_cfg_reco_{uuid.uuid4().hex}"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        rel_path = ".test_tmp/recommended_write.txt"
+        for index in range(2):
+            self.store.record_tool_outcome(
+                "pilot-review",
+                f"Pilot review trust recommendation {index}",
+                status="blocked",
+                subject="self_improvement",
+                tags=["pilot", "review", "self-improvement"],
+                metadata={
+                    "goal_text": f"pilot trusted write seed {index}",
+                    "stop_reason": "needs_approval",
+                    "executed_steps": 0,
+                    "approval_requests": 1,
+                    "approvals_granted": 0,
+                    "opportunity_count": 1,
+                    "opportunity_categories": ["approval_friction", "pilot_trusted_write_candidate"],
+                    "recurring_patterns": [
+                        {
+                            "kind": "trusted_write_candidate",
+                            "key": f"write_text:{rel_path}",
+                            "label": f"write_text on {rel_path}",
+                            "count": index + 1,
+                            "file_operation": "write_text",
+                            "file_path": rel_path,
+                        }
+                    ],
+                },
+            )
+
+        service = CockpitService(self.store, workspace_root=workspace)
+        service.service_manager = CockpitServiceManager(config_dir=config_dir)
+
+        with patch("memory_agent.service_manager.subprocess.run") as run_mock:
+            run_mock.side_effect = [
+                subprocess.CompletedProcess(
+                    ["systemctl", "--user", "is-active", "ernie-cockpit.service"],
+                    3,
+                    stdout="inactive\n",
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    ["systemctl", "--user", "is-active", "ernie-cockpit-remote.service"],
+                    3,
+                    stdout="inactive\n",
+                    stderr="",
+                ),
+            ]
+            settings = service.settings()
+
+        recommendations = settings["pilot_policy"]["trusted_write_recommendations"]
+        self.assertTrue(recommendations)
+        self.assertEqual(recommendations[0]["file_operation"], "write_text")
+        self.assertEqual(recommendations[0]["file_path"], rel_path)
+        self.assertGreaterEqual(recommendations[0]["count"], 2)
 
     def test_service_manager_reports_unconfigured_remote_service(self) -> None:
         config_dir = self.temp_root / f"remote_cfg_missing_{uuid.uuid4().hex}"

@@ -189,6 +189,7 @@ class PilotRunReviewer:
         promote_limit: int = 0,
     ) -> PilotRunReviewReport:
         recurring_patterns = self._historical_patterns(run_report)
+        trusted_write_candidates = self._current_trusted_write_candidates(run_report)
         opportunities: list[ImprovementOpportunity] = []
         opportunities.extend(self._stop_reason_opportunities(run_report))
         opportunities.extend(self._approval_opportunities(run_report))
@@ -214,6 +215,7 @@ class PilotRunReviewer:
                 "approval_requests": int(getattr(run_report, "approval_requests", 0) or 0),
                 "approvals_granted": int(getattr(run_report, "approvals_granted", 0) or 0),
                 "recurring_patterns": recurring_patterns,
+                "trusted_write_candidates": trusted_write_candidates,
                 "opportunity_categories": [
                     opportunity.category for opportunity in deduped
                 ],
@@ -404,6 +406,7 @@ class PilotRunReviewer:
         )
         category_counts: dict[str, int] = {}
         stop_reason_counts: dict[str, int] = {}
+        trusted_write_counts: dict[str, dict[str, Any]] = {}
         current_stop_reason = str(getattr(run_report, "stop_reason", "") or "")
         for outcome in outcomes:
             stop_reason = str(outcome.metadata.get("stop_reason") or "").strip()
@@ -414,6 +417,56 @@ class PilotRunReviewer:
                 if not clean_category:
                     continue
                 category_counts[clean_category] = category_counts.get(clean_category, 0) + 1
+            for candidate in outcome.metadata.get("trusted_write_candidates", []):
+                if not isinstance(candidate, dict):
+                    continue
+                key = str(candidate.get("key") or "").strip()
+                if not key:
+                    continue
+                existing = trusted_write_counts.get(key)
+                count = int(candidate.get("count") or 1)
+                file_operation = str(candidate.get("file_operation") or "").strip()
+                file_path = str(candidate.get("file_path") or "").strip()
+                if (not file_operation or not file_path) and ":" in key:
+                    file_operation, file_path = key.split(":", 1)
+                if existing is None or count > int(existing.get("count") or 0):
+                    trusted_write_counts[key] = {
+                        "kind": "trusted_write_candidate",
+                        "key": key,
+                        "label": str(
+                            candidate.get("label")
+                            or f"{file_operation} on {file_path}".strip()
+                        ),
+                        "count": count,
+                        "file_operation": file_operation,
+                        "file_path": file_path,
+                    }
+            for pattern in outcome.metadata.get("recurring_patterns", []):
+                if not isinstance(pattern, dict):
+                    continue
+                if str(pattern.get("kind") or "").strip() != "trusted_write_candidate":
+                    continue
+                key = str(pattern.get("key") or "").strip()
+                if not key:
+                    continue
+                existing = trusted_write_counts.get(key)
+                count = int(pattern.get("count") or 0)
+                file_operation = str(pattern.get("file_operation") or "").strip()
+                file_path = str(pattern.get("file_path") or "").strip()
+                if (not file_operation or not file_path) and ":" in key:
+                    file_operation, file_path = key.split(":", 1)
+                if existing is None or count > int(existing.get("count") or 0):
+                    trusted_write_counts[key] = {
+                        "kind": "trusted_write_candidate",
+                        "key": key,
+                        "label": str(
+                            pattern.get("label")
+                            or f"{file_operation} on {file_path}".strip()
+                        ),
+                        "count": count,
+                        "file_operation": file_operation,
+                        "file_path": file_path,
+                    }
 
         patterns: list[dict[str, Any]] = []
         current_stop_reason_count = stop_reason_counts.get(current_stop_reason, 0) + (
@@ -446,6 +499,25 @@ class PilotRunReviewer:
                         "count": count,
                     }
                 )
+        for candidate in self._current_trusted_write_candidates(run_report):
+            key = str(candidate.get("key") or "").strip()
+            if not key:
+                continue
+            historical = trusted_write_counts.get(key)
+            count = int(historical.get("count") or 0) if historical is not None else 0
+            count += 1
+            if count < 2:
+                continue
+            patterns.append(
+                {
+                    "kind": "trusted_write_candidate",
+                    "key": key,
+                    "label": candidate["label"],
+                    "count": count,
+                    "file_operation": candidate["file_operation"],
+                    "file_path": candidate["file_path"],
+                }
+            )
         return patterns
 
     def _historical_pattern_opportunities(
@@ -514,7 +586,72 @@ class PilotRunReviewer:
                         },
                     )
                 )
+            elif pattern.get("kind") == "trusted_write_candidate":
+                file_operation = str(pattern.get("file_operation") or "").strip()
+                file_path = str(pattern.get("file_path") or "").strip()
+                count = int(pattern.get("count") or 0)
+                if not file_operation or not file_path or count < 2:
+                    continue
+                opportunities.append(
+                    ImprovementOpportunity(
+                        title=(
+                            f"Review trusted pilot write candidate for {file_path}"
+                        ),
+                        summary=(
+                            "The same low-risk single-file write keeps hitting approval review. "
+                            "Check whether the current threshold or trusted-write settings are too strict "
+                            "for this path and operation."
+                        ),
+                        score=min(0.8 + (0.03 * min(count, 4)), 0.92),
+                        category="pilot_trusted_write_candidate",
+                        details=(
+                            f"Observed repeated approval friction for {file_operation} on "
+                            f"{file_path} across {count} pilot reviews."
+                        ),
+                        source=f"pilot-history-trusted:{file_operation}:{file_path}",
+                        metadata={
+                            "history_kind": "trusted_write_candidate",
+                            "history_key": str(pattern.get("key") or ""),
+                            "history_count": count,
+                            "file_operation": file_operation,
+                            "file_path": file_path,
+                            "goal_text": str(getattr(run_report, 'goal_text', '') or ''),
+                        },
+                    )
+                )
         return opportunities
+
+    def _current_trusted_write_candidates(self, run_report: Any) -> list[dict[str, Any]]:
+        candidates: dict[str, dict[str, Any]] = {}
+        for step in getattr(run_report, "steps", []) or []:
+            approval = getattr(step, "approval", None)
+            if approval is None or str(getattr(approval, "status", "")).strip() != "needs_approval":
+                continue
+            if str(getattr(approval, "category", "")).strip() != "file_operation":
+                continue
+            metadata = dict(getattr(approval, "metadata", {}) or {})
+            file_operation = str(metadata.get("file_operation") or "").strip()
+            file_path = str(metadata.get("file_path") or "").strip()
+            preview = getattr(approval, "preview_patch", None)
+            if not file_operation or not file_path or preview is None:
+                continue
+            if file_operation not in {"write_text", "replace_text", "append_text"}:
+                continue
+            if str(getattr(preview, "status", "")).strip() != "accepted":
+                continue
+            changed_files = list(getattr(preview, "changed_files", []) or [])
+            if changed_files != [file_path]:
+                continue
+            key = f"{file_operation}:{file_path}"
+            candidates[key] = {
+                "kind": "trusted_write_candidate",
+                "key": key,
+                "label": f"{file_operation} on {file_path}",
+                "count": 1,
+                "file_operation": file_operation,
+                "file_path": file_path,
+            }
+        return list(candidates.values())
 
     def _last_step(self, run_report: Any) -> Any | None:
         steps = list(getattr(run_report, "steps", []) or [])
@@ -605,6 +742,7 @@ class PilotHistoryReporter:
         stop_counts: dict[str, int] = {}
         category_counts: dict[str, int] = {}
         pattern_counts: dict[tuple[str, str], dict[str, Any]] = {}
+        trusted_write_counts: dict[str, dict[str, Any]] = {}
 
         for run in recent_runs:
             if run.stop_reason:
@@ -615,6 +753,23 @@ class PilotHistoryReporter:
                 kind = str(pattern.get("kind") or "").strip()
                 key = str(pattern.get("key") or "").strip()
                 if not kind or not key:
+                    continue
+                if kind == "trusted_write_candidate":
+                    existing_candidate = trusted_write_counts.get(key)
+                    count = int(pattern.get("count") or 0)
+                    file_operation = str(pattern.get("file_operation") or "").strip()
+                    file_path = str(pattern.get("file_path") or "").strip()
+                    if (not file_operation or not file_path) and ":" in key:
+                        file_operation, file_path = key.split(":", 1)
+                    if existing_candidate is None or count > int(existing_candidate.get("count") or 0):
+                        trusted_write_counts[key] = {
+                            "kind": kind,
+                            "key": key,
+                            "label": str(pattern.get("label") or f"{file_operation} on {file_path}"),
+                            "count": count,
+                            "file_operation": file_operation,
+                            "file_path": file_path,
+                        }
                     continue
                 compound = (kind, key)
                 existing = pattern_counts.get(compound)
@@ -650,7 +805,7 @@ class PilotHistoryReporter:
             )
         ]
         recurring_patterns = sorted(
-            pattern_counts.values(),
+            [*pattern_counts.values(), *trusted_write_counts.values()],
             key=lambda item: (-int(item.get("count") or 0), str(item.get("label") or "")),
         )
 

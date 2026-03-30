@@ -908,7 +908,11 @@ class LinuxPilotRuntime:
                     reason=(
                         f"File operation '{file_operation}' on '{file_path}' is auto-approved."
                     ),
-                    metadata={"source": source, "file_path": file_path},
+                    metadata={
+                        "source": source,
+                        "file_path": file_path,
+                        "file_operation": file_operation,
+                    },
                 )
             preview = self._build_patch_preview(task, action=action)
             if preview is not None:
@@ -926,6 +930,7 @@ class LinuxPilotRuntime:
                         metadata={
                             "source": source,
                             "file_path": file_path,
+                            "file_operation": file_operation,
                             "execution_task_title": task_title,
                         },
                         preview_patch=preview,
@@ -947,6 +952,7 @@ class LinuxPilotRuntime:
                         metadata={
                             "source": source,
                             "file_path": file_path,
+                            "file_operation": file_operation,
                             "execution_task_title": task_title,
                             "trusted_preview": True,
                             **trusted_match,
@@ -967,6 +973,7 @@ class LinuxPilotRuntime:
                     metadata={
                         "source": source,
                         "file_path": file_path,
+                        "file_operation": file_operation,
                         "execution_task_title": task_title,
                     },
                     preview_patch=preview,
@@ -981,7 +988,11 @@ class LinuxPilotRuntime:
                     f"Approval required before running file operation '{file_operation}' "
                     f"on '{file_path}'."
                 ),
-                metadata={"source": source, "file_path": file_path},
+                metadata={
+                    "source": source,
+                    "file_path": file_path,
+                    "file_operation": file_operation,
+                },
             )
         if command:
             if self.policy.is_auto_approved_shell(command):
