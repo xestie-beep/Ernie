@@ -471,6 +471,7 @@ Default pilot behavior:
 - auto-approves `read_text`
 - auto-approves read/test shell prefixes such as `git status`, `git diff`, `pytest`, and `ruff check`
 - risky file writes and refactors now produce a temp-workspace review packet first, including changed files and a diff preview, and only apply after approval
+- repeated low-risk single-file text writes can auto-approve after enough successful supervised preview applies for that exact file/operation pair; the trusted operations and required success count live in the pilot policy
 - approval-backed file writes/refactors run through the patch runner before apply, so validations and eval checks can fail the change before it reaches the main workspace
 - pilot policy now includes `git_write_mode` with `auto`, `branch`, or `off` so supervised writes can prefer disposable-branch apply on real repos
 - still requires approval for shell commands outside the allowlist

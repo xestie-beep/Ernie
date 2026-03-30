@@ -926,6 +926,134 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(report.execution_result.patch_run.status, "applied")
         self.assertEqual(target.read_text(encoding="utf-8"), "approved\n")
 
+    def test_linux_pilot_runtime_auto_approves_trusted_low_risk_write(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}_pilot_trusted.txt"
+        self.extra_paths.append(target)
+        target.write_text("alpha\n", encoding="utf-8")
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+        rel_path = str(target.relative_to(Path.cwd()))
+
+        for index in range(2):
+            self.store.record_patch_run(
+                run_name=f"trusted preview {index}",
+                suite_name="builtin",
+                task_title="Trusted pilot write",
+                status="applied",
+                baseline_evaluation={"score": 1.0},
+                candidate_evaluation={"score": 1.0},
+                apply_on_success=True,
+                applied=True,
+                workspace_path=str(Path.cwd()),
+                changed_files=[rel_path],
+                operation_results=[
+                    {
+                        "operation": "write_text",
+                        "path": rel_path,
+                        "status": "success",
+                    }
+                ],
+                validation_results=[],
+                summary={"git": {"status": "not_applicable", "rollback_ready": False}},
+            )
+
+        self.store.record_task(
+            "Trusted pilot write",
+            status="open",
+            area="execution",
+            file_operation="write_text",
+            file_path=rel_path,
+            file_text="trusted\n",
+            complete_on_success=True,
+        )
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        self._record_green_baseline()
+        runtime = LinuxPilotRuntime(
+            self.store,
+            policy=policy,
+            patch_runner=self._make_runtime_patch_runner(),
+        )
+
+        report = runtime.run_turn("trusted pilot write", use_model=False)
+
+        self.assertEqual(report.approval.status, "auto_approved")
+        self.assertEqual(report.approval.category, "trusted_file_operation")
+        self.assertIsNotNone(report.execution_result)
+        self.assertEqual(report.execution_result.status, "success")
+        self.assertEqual(report.execution_result.executed_kind, "run_patch_preview")
+        self.assertEqual(target.read_text(encoding="utf-8"), "trusted\n")
+
+    def test_linux_pilot_runtime_respects_trusted_write_threshold(self) -> None:
+        target = self.temp_root / f"{uuid.uuid4().hex}_pilot_trusted_threshold.txt"
+        self.extra_paths.append(target)
+        target.write_text("alpha\n", encoding="utf-8")
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+        rel_path = str(target.relative_to(Path.cwd()))
+
+        for index in range(2):
+            self.store.record_patch_run(
+                run_name=f"trusted threshold {index}",
+                suite_name="builtin",
+                task_title="Trusted threshold write",
+                status="applied",
+                baseline_evaluation={"score": 1.0},
+                candidate_evaluation={"score": 1.0},
+                apply_on_success=True,
+                applied=True,
+                workspace_path=str(Path.cwd()),
+                changed_files=[rel_path],
+                operation_results=[
+                    {
+                        "operation": "write_text",
+                        "path": rel_path,
+                        "status": "success",
+                    }
+                ],
+                validation_results=[],
+                summary={"git": {"status": "not_applicable", "rollback_ready": False}},
+            )
+
+        self.store.record_task(
+            "Trusted threshold write",
+            status="open",
+            area="execution",
+            file_operation="write_text",
+            file_path=rel_path,
+            file_text="threshold\n",
+            complete_on_success=True,
+        )
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        policy.trusted_auto_approve_required_successes = 3
+        self._record_green_baseline()
+        runtime = LinuxPilotRuntime(
+            self.store,
+            policy=policy,
+            patch_runner=self._make_runtime_patch_runner(),
+        )
+
+        report = runtime.run_turn("trusted threshold write", use_model=False)
+
+        self.assertEqual(report.approval.status, "needs_approval")
+        self.assertEqual(report.approval.category, "file_operation")
+        self.assertIsNotNone(report.approval.preview_patch)
+        self.assertIsNone(report.execution_result)
+
+    def test_linux_pilot_policy_round_trips_trusted_write_settings(self) -> None:
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trusted_auto_approve_file_operations = {"append_text"}
+        policy.trusted_auto_approve_required_successes = 4
+        policy_path = self.temp_root / f"{uuid.uuid4().hex}_pilot_policy.toml"
+        self.extra_paths.append(policy_path)
+        policy_path.write_text(policy.render_template(), encoding="utf-8")
+
+        loaded = LinuxPilotPolicy.load(policy_path, workspace_root=Path.cwd())
+
+        self.assertEqual(loaded.trusted_auto_approve_file_operations, {"append_text"})
+        self.assertEqual(loaded.trusted_auto_approve_required_successes, 4)
+
     def test_linux_pilot_runtime_can_approve_pending_turn_without_duplicate_user_event(self) -> None:
         target = self.temp_root / f"{uuid.uuid4().hex}_pilot_pending.txt"
         self.extra_paths.append(target)

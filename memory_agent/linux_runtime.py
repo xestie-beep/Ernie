@@ -43,6 +43,8 @@ from .shell_adapter import GuardedShellAdapter
 
 DEFAULT_AUTO_APPROVE_ACTION_KINDS = {"ask_user", "noop", "prepare_task", "run_maintenance"}
 DEFAULT_AUTO_APPROVE_FILE_OPERATIONS = {"read_text"}
+TRUSTED_AUTO_APPROVE_FILE_OPERATIONS = {"write_text", "replace_text", "append_text"}
+TRUSTED_AUTO_APPROVE_REQUIRED_SUCCESSES = 2
 DEFAULT_AUTO_APPROVE_SHELL_PREFIXES: tuple[tuple[str, ...], ...] = (
     ("python3", "-m", "unittest"),
     ("python3", "-m", "pytest"),
@@ -70,6 +72,8 @@ class LinuxPilotPolicy:
     git_write_mode: str = "auto"
     auto_approve_action_kinds: set[str] = field(default_factory=set)
     auto_approve_file_operations: set[str] = field(default_factory=set)
+    trusted_auto_approve_file_operations: set[str] = field(default_factory=set)
+    trusted_auto_approve_required_successes: int = TRUSTED_AUTO_APPROVE_REQUIRED_SUCCESSES
     auto_approve_shell_prefixes: tuple[tuple[str, ...], ...] = field(default_factory=tuple)
     loaded_from: str | None = None
 
@@ -85,6 +89,8 @@ class LinuxPilotPolicy:
             git_write_mode="auto",
             auto_approve_action_kinds=set(DEFAULT_AUTO_APPROVE_ACTION_KINDS),
             auto_approve_file_operations=set(DEFAULT_AUTO_APPROVE_FILE_OPERATIONS),
+            trusted_auto_approve_file_operations=set(TRUSTED_AUTO_APPROVE_FILE_OPERATIONS),
+            trusted_auto_approve_required_successes=TRUSTED_AUTO_APPROVE_REQUIRED_SUCCESSES,
             auto_approve_shell_prefixes=tuple(DEFAULT_AUTO_APPROVE_SHELL_PREFIXES),
         )
 
@@ -129,6 +135,8 @@ class LinuxPilotPolicy:
         if isinstance(approvals, dict):
             action_kinds = approvals.get("auto_approve_action_kinds")
             file_operations = approvals.get("auto_approve_file_operations")
+            trusted_file_operations = approvals.get("trusted_auto_approve_file_operations")
+            trusted_required_successes = approvals.get("trusted_auto_approve_required_successes")
             shell_prefixes = approvals.get("auto_approve_shell_prefixes")
             if isinstance(action_kinds, list):
                 policy.auto_approve_action_kinds = {
@@ -142,6 +150,17 @@ class LinuxPilotPolicy:
                     for item in file_operations
                     if str(item).strip()
                 }
+            if isinstance(trusted_file_operations, list):
+                policy.trusted_auto_approve_file_operations = {
+                    str(item).strip()
+                    for item in trusted_file_operations
+                    if str(item).strip()
+                }
+            if (
+                isinstance(trusted_required_successes, int)
+                and trusted_required_successes >= 0
+            ):
+                policy.trusted_auto_approve_required_successes = trusted_required_successes
             if isinstance(shell_prefixes, list):
                 parsed_prefixes: list[tuple[str, ...]] = []
                 for item in shell_prefixes:
@@ -166,6 +185,12 @@ class LinuxPilotPolicy:
             "git_write_mode": self.git_write_mode,
             "auto_approve_action_kinds": sorted(self.auto_approve_action_kinds),
             "auto_approve_file_operations": sorted(self.auto_approve_file_operations),
+            "trusted_auto_approve_file_operations": sorted(
+                self.trusted_auto_approve_file_operations
+            ),
+            "trusted_auto_approve_required_successes": (
+                self.trusted_auto_approve_required_successes
+            ),
             "auto_approve_shell_prefixes": [
                 " ".join(prefix) for prefix in self.auto_approve_shell_prefixes
             ],
@@ -185,6 +210,10 @@ class LinuxPilotPolicy:
             f"{self._toml_string(item)},"
             for item in sorted(self.auto_approve_file_operations)
         )
+        trusted_file_lines = "\n".join(
+            f"{self._toml_string(item)},"
+            for item in sorted(self.trusted_auto_approve_file_operations)
+        )
         return (
             "# Supervised Linux pilot policy for the memory-first agent\n"
             "[general]\n"
@@ -200,6 +229,11 @@ class LinuxPilotPolicy:
             "auto_approve_file_operations = [\n"
             f"{self._indent_block(file_lines)}\n"
             "]\n"
+            "trusted_auto_approve_file_operations = [\n"
+            f"{self._indent_block(trusted_file_lines)}\n"
+            "]\n"
+            "trusted_auto_approve_required_successes = "
+            f"{self.trusted_auto_approve_required_successes}\n"
             "auto_approve_shell_prefixes = [\n"
             f"{self._indent_block(shell_lines)}\n"
             "]\n"
@@ -879,6 +913,26 @@ class LinuxPilotRuntime:
                         },
                         preview_patch=preview,
                     )
+                if self._is_trusted_preview_write(
+                    file_operation=file_operation,
+                    file_path=file_path,
+                    preview=preview,
+                ):
+                    return ApprovalDecision(
+                        status="auto_approved",
+                        category="trusted_file_operation",
+                        reason=(
+                            f"File operation '{file_operation}' on '{file_path}' matched repeated "
+                            "successful supervised previews and is auto-approved."
+                        ),
+                        metadata={
+                            "source": source,
+                            "file_path": file_path,
+                            "execution_task_title": task_title,
+                            "trusted_preview": True,
+                        },
+                        preview_patch=preview,
+                    )
                 changed_count = len(preview.changed_files)
                 return ApprovalDecision(
                     status="needs_approval",
@@ -955,6 +1009,48 @@ class LinuxPilotRuntime:
             operations=[operation],
             task_title=str(task.metadata.get("title") or action.title),
         )
+
+    def _is_trusted_preview_write(
+        self,
+        *,
+        file_operation: str,
+        file_path: str,
+        preview: PatchRunReport,
+    ) -> bool:
+        normalized_path = str(file_path or "").strip()
+        normalized_operation = str(file_operation or "").strip()
+        if (
+            self.policy.trusted_auto_approve_required_successes <= 0
+            or normalized_operation
+            not in self.policy.trusted_auto_approve_file_operations
+        ):
+            return False
+        if preview.status != "accepted":
+            return False
+        if list(preview.changed_files) != [normalized_path]:
+            return False
+
+        matches = 0
+        for offset in range(12):
+            patch_run = self.memory_store.latest_patch_run(offset=offset)
+            if patch_run is None:
+                break
+            if patch_run.get("status") != "applied" or not bool(patch_run.get("applied")):
+                continue
+            if list(patch_run.get("changed_files") or []) != [normalized_path]:
+                continue
+            operation_results = patch_run.get("operation_results") or []
+            if len(operation_results) != 1:
+                continue
+            operation_result = operation_results[0]
+            if str(operation_result.get("operation") or "").strip() != normalized_operation:
+                continue
+            if str(operation_result.get("path") or "").strip() != normalized_path:
+                continue
+            matches += 1
+            if matches >= self.policy.trusted_auto_approve_required_successes:
+                return True
+        return False
 
     def _execution_message(
         self,
