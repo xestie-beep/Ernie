@@ -95,6 +95,109 @@ python -m memory_agent.cli chat
 
 The default database lives at `.agent/agent_memory.sqlite3` in the workspace.
 
+## Cockpit UI
+
+The project now includes a local cockpit service and browser UI for day-to-day operation.
+
+Fastest local startup on Linux:
+
+```bash
+./scripts/run_cockpit.sh start local
+```
+
+Local-only use on the machine running Ernie:
+
+```bash
+python3 -m memory_agent.cli serve
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8765/
+```
+
+Remote use over a trusted network such as Tailscale:
+
+```bash
+./scripts/run_cockpit.sh start remote
+```
+
+or, explicitly:
+
+```bash
+python3 -m memory_agent.cli serve --remote --display-host 100.x.y.z
+```
+
+That binds on `0.0.0.0`, generates a shared token automatically when needed, and prints a ready-to-open access URL.
+
+If you want to provide your own token instead:
+
+```bash
+python3 -m memory_agent.cli serve --remote --token YOUR_SHARED_TOKEN --display-host 100.x.y.z
+```
+
+Then open the remote machine's reachable address, for example:
+
+```text
+http://100.x.y.z:8765/
+```
+
+The cockpit will prompt for the shared token or auto-bootstrap from the printed URL, exchange it for a browser session, and then stop relying on the token in the URL.
+
+Useful launcher commands:
+
+```bash
+./scripts/run_cockpit.sh status
+./scripts/run_cockpit.sh stop
+./scripts/run_cockpit.sh restart remote --display-host 100.x.y.z
+```
+
+Desktop integration on Ubuntu:
+
+```bash
+./scripts/install_desktop_launcher.sh
+```
+
+That installs:
+
+- a user launcher at `~/.local/bin/ernie-cockpit`
+- a desktop entry at `~/.local/share/applications/ernie-cockpit.desktop`
+- a user icon at `~/.local/share/icons/hicolor/scalable/apps/ernie-cockpit.svg`
+
+After that, you can launch **Ernie Cockpit** from the app menu or run `ernie-cockpit`.
+
+Persistent local service on Ubuntu:
+
+```bash
+./scripts/install_user_service.sh
+systemctl --user status ernie-cockpit.service
+```
+
+That installs a user-level `systemd` service for the local cockpit on `127.0.0.1:8765`.
+Once installed, the desktop launcher will prefer the service instead of starting a fresh local process.
+
+Persistent remote service on Ubuntu:
+
+```bash
+./scripts/install_remote_service.sh
+./scripts/manage_remote_access.sh show
+```
+
+By default, the remote service:
+
+- runs as `ernie-cockpit-remote.service`
+- binds on `0.0.0.0:8766`
+- stores its token and display host in `~/.config/ernie-cockpit/remote.env`
+
+Useful remote access commands:
+
+```bash
+systemctl --user status ernie-cockpit-remote.service
+./scripts/manage_remote_access.sh show
+./scripts/manage_remote_access.sh rotate
+```
+
 ## Linux handoff
 
 If you want to move the working agent state to a Linux box without juggling multiple files by hand, use the handoff bundle flow:

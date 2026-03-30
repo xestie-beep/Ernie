@@ -31,7 +31,11 @@ python -m memory_agent.cli handoff-pack
 ```bash
 ./scripts/bootstrap_linux.sh
 python3 -m memory_agent.cli handoff-restore /path/to/linux_handoff.zip
-python3 -m memory_agent.cli pilot-chat --no-model
+./scripts/run_cockpit.sh start local
+./scripts/install_desktop_launcher.sh
+./scripts/install_user_service.sh
+./scripts/install_remote_service.sh
+./scripts/manage_remote_access.sh show
 ```
 
 ## Notes

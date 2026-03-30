@@ -5,14 +5,16 @@ import shutil
 import unittest
 import uuid
 import zipfile
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
 from argparse import Namespace
 
 import memory_agent.cli as cli_module
+from memory_agent.cockpit import CockpitService
 from memory_agent.agent import MemoryFirstAgent
-from memory_agent.cli import _resolve_patch_run_args, _run_pilot_chat
+from memory_agent.cli import _resolve_patch_run_args, _resolve_serve_config, _run_pilot_chat, build_parser
 from memory_agent.evaluation import (
     EvalCheckResult,
     EvalScenarioResult,
@@ -30,6 +32,7 @@ from memory_agent.models import MemoryDraft
 from memory_agent.patch_runner import PatchOperation, WorkspacePatchRunner
 from memory_agent.planner import MemoryPlanner
 from memory_agent.reranker import OptionalSemanticReranker
+from memory_agent.service_manager import CockpitServiceManager
 from memory_agent.shell_adapter import GuardedShellAdapter
 
 
@@ -3387,6 +3390,316 @@ class MemoryStoreTests(unittest.TestCase):
         report = MemoryEvaluator(Path.cwd()).run_builtin_suite()
         self.assertTrue(report.passed)
         self.assertGreaterEqual(report.score, 0.99)
+
+    def test_cockpit_service_snapshot_and_context_surface_core_state(self) -> None:
+        self.store.record_task(
+            "Ship cockpit API",
+            status="open",
+            area="execution",
+            due_date="2026-04-10",
+        )
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+
+        snapshot = service.snapshot(query="cockpit", limit=5)
+        context = service.context(query="cockpit", limit=5)
+
+        self.assertIn("stats", snapshot)
+        self.assertIn("plan", snapshot)
+        self.assertIn("ready_tasks", snapshot)
+        self.assertIn("open_tasks", snapshot)
+        self.assertIn("recent_nudges", snapshot)
+        ready_titles = [
+            str(task["metadata"].get("title") or task["content"])
+            for task in snapshot["ready_tasks"]
+        ]
+        self.assertIn("Ship cockpit API", ready_titles)
+        self.assertEqual(context["query"], "cockpit")
+        self.assertIn("ready_tasks", context)
+
+    def test_cockpit_service_observe_and_execute_next(self) -> None:
+        self.store.record_task(
+            "Ship local cockpit",
+            status="open",
+            area="execution",
+        )
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+
+        observed = service.observe(
+            role="user",
+            text="We need a cockpit UI for the local agent.",
+        )
+        executed = service.execute_next(query="ship local cockpit", limit=3)
+
+        self.assertGreater(observed["event_id"], 0)
+        self.assertTrue(observed["stored_memories"])
+        self.assertEqual(executed["result"]["status"], "success")
+        self.assertEqual(executed["result"]["executed_kind"], "work_task")
+        active = self.store.find_active_task("Ship local cockpit", area="execution")
+        self.assertIsNotNone(active)
+        self.assertEqual(active.metadata.get("status"), "in_progress")
+
+    def test_cockpit_health_payload_reports_service_state(self) -> None:
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+        snapshot = service.snapshot(query="health", limit=3)
+        self.assertIn("stats", snapshot)
+        self.assertIn("plan", snapshot)
+
+    def test_cockpit_service_task_detail_and_patch_runs(self) -> None:
+        task = self.store.record_task(
+            "Review cockpit task detail",
+            status="open",
+            area="execution",
+            blocked_by=["Upstream review"],
+            due_date="2026-04-11",
+        )
+        self.store.record_patch_run(
+            run_name="cockpit patch demo",
+            suite_name="builtin",
+            task_title="Review cockpit task detail",
+            status="applied",
+            workspace_path=str(Path.cwd()),
+            changed_files=["memory_agent/cockpit.py"],
+            summary={"git": {"rollback_ready": False, "status": "direct_apply"}},
+        )
+
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+        detail = service.task_detail(title="Review cockpit task detail", area="execution")
+        runs = service.patch_runs(limit=3)
+
+        self.assertEqual(detail["task"]["id"], task.id)
+        self.assertEqual(detail["task"]["metadata"]["due_date"], "2026-04-11")
+        self.assertEqual(runs[0]["run_name"], "cockpit patch demo")
+
+    def test_cockpit_service_preview_and_reject_pilot_turn(self) -> None:
+        workspace = self._make_workspace()
+        target = workspace / "pilot_eval.txt"
+        target.write_text("alpha\nbeta\n", encoding="utf-8")
+        self.store.record_task(
+            "Pilot risky write",
+            status="open",
+            area="execution",
+            file_operation="replace_text",
+            file_path=str(target.relative_to(workspace)),
+            find_text="beta",
+            file_text="gamma",
+            complete_on_success=True,
+        )
+        service = CockpitService(self.store, workspace_root=workspace)
+
+        preview = service.preview_pilot_turn(
+            text="pilot risky write",
+            action_limit=3,
+            use_model=False,
+        )
+
+        self.assertIsNotNone(preview["pending_id"])
+        self.assertEqual(len(service.pending_pilot_queue()), 1)
+        rejected = service.reject_pilot_turn(
+            pending_id=preview["pending_id"],
+            reason="reject in test",
+        )
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(service.pending_pilot_queue(), [])
+
+    def test_cockpit_service_session_and_task_actions(self) -> None:
+        self.store.record_task(
+            "Session task",
+            status="open",
+            area="execution",
+        )
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+        service._configured_auth_token = "secret"
+
+        session = service.create_session(token="secret")
+        self.assertIn("session_id", session)
+        self.assertIn(session["session_id"], service.active_sessions)
+
+        resumed = service.task_action(
+            action="resume",
+            title="Session task",
+            area="execution",
+        )
+        self.assertEqual(resumed["metadata"]["status"], "open")
+
+        completed = service.task_action(
+            action="complete",
+            title="Session task",
+            area="execution",
+        )
+        self.assertEqual(completed["completed"]["metadata"]["status"], "done")
+
+    def test_cockpit_service_settings_and_remote_token_rotation(self) -> None:
+        config_dir = self.temp_root / f"remote_cfg_{uuid.uuid4().hex}"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "remote.env").write_text(
+            'PORT="8766"\nTOKEN="secret-token"\nDISPLAY_HOST="100.1.2.3"\n',
+            encoding="utf-8",
+        )
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+        service.service_manager = CockpitServiceManager(config_dir=config_dir)
+
+        with patch("memory_agent.service_manager.subprocess.run") as run_mock:
+            run_mock.side_effect = [
+                subprocess.CompletedProcess(
+                    ["systemctl", "--user", "is-active", "ernie-cockpit.service"],
+                    0,
+                    stdout="active\n",
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    ["systemctl", "--user", "is-active", "ernie-cockpit-remote.service"],
+                    0,
+                    stdout="active\n",
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    ["systemctl", "--user", "restart", "ernie-cockpit-remote.service"],
+                    0,
+                    stdout="",
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    ["systemctl", "--user", "is-active", "ernie-cockpit-remote.service"],
+                    0,
+                    stdout="active\n",
+                    stderr="",
+                ),
+            ]
+            settings = service.settings()
+            rotated = service.rotate_remote_access_token()
+
+        self.assertTrue(settings["local_service"]["active"])
+        self.assertEqual(settings["remote_service"]["url"], "http://100.1.2.3:8766/")
+        self.assertTrue(settings["actions"])
+        self.assertFalse(
+            next(
+                item["enabled"]
+                for item in settings["actions"]
+                if item["action"] == "install_desktop_launcher"
+            )
+        )
+        self.assertTrue(
+            next(
+                item["requires_confirmation"]
+                for item in settings["actions"]
+                if item["action"] == "install_remote_service"
+            )
+        )
+        self.assertTrue(rotated["rotated"])
+        self.assertNotEqual(rotated["token"], "secret-token")
+
+    def test_service_manager_reports_unconfigured_remote_service(self) -> None:
+        config_dir = self.temp_root / f"remote_cfg_missing_{uuid.uuid4().hex}"
+        manager = CockpitServiceManager(config_dir=config_dir)
+        with patch("memory_agent.service_manager.subprocess.run") as run_mock:
+            run_mock.side_effect = [
+                subprocess.CompletedProcess(
+                    ["systemctl", "--user", "is-active", "ernie-cockpit.service"],
+                    3,
+                    stdout="inactive\n",
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    ["systemctl", "--user", "is-active", "ernie-cockpit-remote.service"],
+                    3,
+                    stdout="inactive\n",
+                    stderr="",
+                ),
+            ]
+            payload = manager.settings()
+        self.assertFalse(payload["remote_service"]["configured"])
+        self.assertEqual(payload["remote_service"]["token"], "")
+        self.assertTrue(payload["onboarding"]["recommended_steps"])
+        onboarding_actions = {item["action"] for item in payload["onboarding"]["actions"]}
+        self.assertIn("install_remote_service", onboarding_actions)
+
+    def test_service_manager_performs_guided_setup_action(self) -> None:
+        config_dir = self.temp_root / f"remote_cfg_action_{uuid.uuid4().hex}"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        manager = CockpitServiceManager(config_dir=config_dir)
+        with patch("memory_agent.service_manager.subprocess.run") as run_mock:
+            run_mock.side_effect = [
+                subprocess.CompletedProcess(
+                    ["systemctl", "--user", "restart", "ernie-cockpit.service"],
+                    0,
+                    stdout="",
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    ["systemctl", "--user", "is-active", "ernie-cockpit.service"],
+                    0,
+                    stdout="active\n",
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    ["systemctl", "--user", "is-active", "ernie-cockpit.service"],
+                    0,
+                    stdout="active\n",
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    ["systemctl", "--user", "is-active", "ernie-cockpit-remote.service"],
+                    3,
+                    stdout="inactive\n",
+                    stderr="",
+                ),
+            ]
+            payload = manager.perform_action("restart_local_service")
+        self.assertEqual(payload["action"], "restart_local_service")
+        self.assertEqual(payload["meta"]["label"], "Restart local service")
+        self.assertTrue(payload["result"]["ok"])
+        self.assertIn("Local cockpit service restarted.", payload["message"])
+        self.assertTrue(payload["settings"]["local_service"]["active"])
+
+    def test_build_parser_includes_serve_command(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--host", "127.0.0.1", "--port", "9001"])
+        self.assertEqual(args.command, "serve")
+        self.assertEqual(args.host, "127.0.0.1")
+        self.assertEqual(args.port, 9001)
+
+    def test_build_parser_accepts_serve_token(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--host", "0.0.0.0", "--port", "9001", "--token", "secret"])
+        self.assertEqual(args.command, "serve")
+        self.assertEqual(args.token, "secret")
+
+    def test_build_parser_accepts_remote_serve_options(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["serve", "--remote", "--display-host", "100.1.2.3"])
+        self.assertEqual(args.command, "serve")
+        self.assertTrue(args.remote)
+        self.assertEqual(args.display_host, "100.1.2.3")
+
+    def test_resolve_serve_config_generates_remote_token_and_access_url(self) -> None:
+        args = Namespace(
+            host="127.0.0.1",
+            port=8765,
+            remote=True,
+            token=None,
+            display_host="100.1.2.3",
+        )
+        with patch.object(cli_module.secrets, "token_hex", return_value="feedfacefeedface"):
+            config = _resolve_serve_config(args)
+        self.assertEqual(config["host"], "0.0.0.0")
+        self.assertEqual(config["token"], "feedfacefeedface")
+        self.assertEqual(
+            config["access_url"],
+            "http://100.1.2.3:8765/?token=feedfacefeedface",
+        )
+
+    def test_resolve_serve_config_preserves_local_access_url_without_token(self) -> None:
+        args = Namespace(
+            host="127.0.0.1",
+            port=9001,
+            remote=False,
+            token=None,
+            display_host=None,
+        )
+        config = _resolve_serve_config(args)
+        self.assertEqual(config["host"], "127.0.0.1")
+        self.assertIsNone(config["token"])
+        self.assertEqual(config["access_url"], "http://127.0.0.1:9001/")
 
     def test_synthesize_profiles_creates_stable_long_term_memory(self) -> None:
         self.store.remember(

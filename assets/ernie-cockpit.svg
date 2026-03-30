@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Ernie Cockpit</title>
+  <desc id="desc">Retro-futuristic cockpit icon with neon accents.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0a0d1e"/>
+      <stop offset="100%" stop-color="#181f43"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#35f6d5"/>
+      <stop offset="100%" stop-color="#7a6dff"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ff4fa3"/>
+      <stop offset="100%" stop-color="#ffb347"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="42" fill="url(#bg)"/>
+  <rect x="32" y="32" width="192" height="192" rx="30" fill="none" stroke="#35f6d5" stroke-opacity="0.28" stroke-width="4"/>
+  <path d="M48 186h160" stroke="#35f6d5" stroke-opacity="0.18" stroke-width="6" stroke-linecap="round"/>
+  <path d="M62 78h132c10.493 0 19 8.507 19 19v48c0 10.493-8.507 19-19 19H62c-10.493 0-19-8.507-19-19V97c0-10.493 8.507-19 19-19z" fill="#0d132d" stroke="#7a6dff" stroke-opacity="0.45" stroke-width="4"/>
+  <path d="M58 100h140v42H58z" fill="url(#screen)" opacity="0.92"/>
+  <path d="M58 126h140" stroke="#0a0d1e" stroke-opacity="0.35" stroke-width="3"/>
+  <path d="M86 117h84" stroke="#f8f5ff" stroke-opacity="0.78" stroke-width="4" stroke-linecap="round"/>
+  <path d="M86 135h66" stroke="#f8f5ff" stroke-opacity="0.52" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="84" cy="191" r="14" fill="#101126" stroke="#35f6d5" stroke-width="4"/>
+  <circle cx="172" cy="191" r="14" fill="#101126" stroke="#ff4fa3" stroke-width="4"/>
+  <path d="M114 176h28c6.627 0 12 5.373 12 12v6c0 6.627-5.373 12-12 12h-28c-6.627 0-12-5.373-12-12v-6c0-6.627 5.373-12 12-12z" fill="#0d132d" stroke="url(#beam)" stroke-width="4"/>
+  <path d="M118 191h20" stroke="#ffb347" stroke-width="4" stroke-linecap="round"/>
+</svg>

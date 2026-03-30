@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 from pathlib import Path
 from typing import Callable
 
 from .agent import MemoryFirstAgent
 from .config import DEFAULT_DB_PATH
+from .cockpit import serve_cockpit
 from .evaluation import MemoryEvaluator
 from .executor import MemoryExecutor
 from .improvement import MemoryImprovementEngine, PilotHistoryReporter, PilotRunReviewer
@@ -343,6 +345,26 @@ def build_parser() -> argparse.ArgumentParser:
     handoff_restore_parser.add_argument("--target-root", type=Path)
     handoff_restore_parser.add_argument("--force", action="store_true")
     handoff_restore_parser.add_argument("--json", action="store_true")
+
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Run the local cockpit service and browser UI on this machine.",
+    )
+    serve_parser.add_argument("--host", default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=8765)
+    serve_parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Bind on 0.0.0.0 and require token auth for remote cockpit access.",
+    )
+    serve_parser.add_argument(
+        "--token",
+        help="Optional shared token required for remote cockpit API access.",
+    )
+    serve_parser.add_argument(
+        "--display-host",
+        help="Optional browser-facing host or IP to print in the startup URL.",
+    )
 
     subparsers.add_parser("model-status", help="Print main-model backend status.")
     subparsers.add_parser("stats", help="Print basic database stats.")
@@ -828,6 +850,18 @@ def main(argv: list[str] | None = None) -> int:
                 print(report.render())
             return 0
 
+        if args.command == "serve":
+            config = _resolve_serve_config(args)
+            serve_cockpit(
+                store,
+                host=str(config["host"]),
+                port=int(config["port"]),
+                workspace_root=Path.cwd(),
+                auth_token=str(config["token"] or "") or None,
+                access_url=str(config["access_url"] or "") or None,
+            )
+            return 0
+
         if args.command == "model-status":
             agent = MemoryFirstAgent(store)
             print(json.dumps(agent.model_status(), indent=2))
@@ -873,6 +907,37 @@ def _run_chat(store: MemoryStore) -> int:
             "into the main model next."
         )
         print("")
+
+
+def _resolve_serve_config(args: argparse.Namespace) -> dict[str, object]:
+    host = str(getattr(args, "host", "127.0.0.1") or "127.0.0.1").strip() or "127.0.0.1"
+    port = int(getattr(args, "port", 8765) or 8765)
+    remote = bool(getattr(args, "remote", False))
+    token = str(getattr(args, "token", "") or "").strip() or None
+    display_host = str(getattr(args, "display_host", "") or "").strip() or None
+
+    if remote:
+        if host == "127.0.0.1":
+            host = "0.0.0.0"
+        if not token:
+            token = secrets.token_hex(16)
+
+    access_url: str | None = None
+    if display_host:
+        access_url = f"http://{display_host}:{port}/"
+        if token:
+            access_url += f"?token={token}"
+    elif not remote and host not in {"0.0.0.0", "::"}:
+        access_url = f"http://{host}:{port}/"
+
+    return {
+        "host": host,
+        "port": port,
+        "remote": remote,
+        "token": token,
+        "display_host": display_host,
+        "access_url": access_url,
+    }
 
 
 def _run_pilot_chat(
