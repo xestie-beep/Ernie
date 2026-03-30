@@ -979,6 +979,10 @@ class MemoryStoreTests(unittest.TestCase):
 
         self.assertEqual(report.approval.status, "auto_approved")
         self.assertEqual(report.approval.category, "trusted_file_operation")
+        self.assertEqual(report.approval.metadata.get("trusted_operation"), "write_text")
+        self.assertEqual(report.approval.metadata.get("trusted_path"), rel_path)
+        self.assertEqual(report.approval.metadata.get("matched_successes"), 2)
+        self.assertEqual(report.approval.metadata.get("required_successes"), 2)
         self.assertIsNotNone(report.execution_result)
         self.assertEqual(report.execution_result.status, "success")
         self.assertEqual(report.execution_result.executed_kind, "run_patch_preview")
@@ -3715,6 +3719,70 @@ class MemoryStoreTests(unittest.TestCase):
         )
         self.assertTrue(rotated["rotated"])
         self.assertNotEqual(rotated["token"], "secret-token")
+
+    def test_cockpit_service_settings_include_and_update_pilot_policy(self) -> None:
+        workspace = self._make_workspace()
+        config_dir = self.temp_root / f"pilot_cfg_{uuid.uuid4().hex}"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        service = CockpitService(self.store, workspace_root=workspace)
+        service.service_manager = CockpitServiceManager(config_dir=config_dir)
+
+        with patch("memory_agent.service_manager.subprocess.run") as run_mock:
+            run_mock.side_effect = [
+                subprocess.CompletedProcess(
+                    ["systemctl", "--user", "is-active", "ernie-cockpit.service"],
+                    3,
+                    stdout="inactive\n",
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    ["systemctl", "--user", "is-active", "ernie-cockpit-remote.service"],
+                    3,
+                    stdout="inactive\n",
+                    stderr="",
+                ),
+            ]
+            settings = service.settings()
+
+        self.assertIn("pilot_policy", settings)
+        self.assertTrue(settings["pilot_policy"]["trusted_writes_enabled"])
+        self.assertEqual(
+            settings["pilot_policy"]["trusted_auto_approve_required_successes"],
+            2,
+        )
+
+        disabled = service.update_pilot_policy(
+            trusted_writes_enabled=False,
+            trusted_write_required_successes=3,
+        )
+        self.assertFalse(disabled["pilot_policy"]["trusted_writes_enabled"])
+        self.assertEqual(
+            disabled["pilot_policy"]["trusted_auto_approve_file_operations"],
+            [],
+        )
+        self.assertEqual(
+            disabled["pilot_policy"]["trusted_auto_approve_required_successes"],
+            3,
+        )
+
+        enabled = service.update_pilot_policy(
+            trusted_writes_enabled=True,
+            trusted_write_required_successes=4,
+            trusted_write_operations=["append_text"],
+        )
+        self.assertTrue(enabled["pilot_policy"]["trusted_writes_enabled"])
+        self.assertEqual(
+            enabled["pilot_policy"]["trusted_auto_approve_file_operations"],
+            ["append_text"],
+        )
+        self.assertEqual(
+            enabled["pilot_policy"]["trusted_auto_approve_required_successes"],
+            4,
+        )
+
+        reloaded = LinuxPilotPolicy.load(workspace_root=workspace)
+        self.assertEqual(reloaded.trusted_auto_approve_file_operations, {"append_text"})
+        self.assertEqual(reloaded.trusted_auto_approve_required_successes, 4)
 
     def test_service_manager_reports_unconfigured_remote_service(self) -> None:
         config_dir = self.temp_root / f"remote_cfg_missing_{uuid.uuid4().hex}"

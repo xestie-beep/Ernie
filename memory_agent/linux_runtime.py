@@ -197,6 +197,23 @@ class LinuxPilotPolicy:
             "loaded_from": self.loaded_from,
         }
 
+    def resolved_policy_path(self, path: Path | None = None) -> Path:
+        candidate = path
+        if candidate is None:
+            candidate = (
+                Path(self.loaded_from)
+                if self.loaded_from
+                else (self.workspace_root / DEFAULT_PILOT_POLICY_PATH)
+            )
+        return candidate.resolve()
+
+    def write(self, path: Path | None = None) -> Path:
+        target = self.resolved_policy_path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.render_template(), encoding="utf-8")
+        self.loaded_from = str(target)
+        return target
+
     def render_template(self) -> str:
         shell_lines = "\n".join(
             f"{self._toml_string(' '.join(prefix))},"
@@ -913,23 +930,26 @@ class LinuxPilotRuntime:
                         },
                         preview_patch=preview,
                     )
-                if self._is_trusted_preview_write(
+                trusted_match = self._trusted_preview_write_match(
                     file_operation=file_operation,
                     file_path=file_path,
                     preview=preview,
-                ):
+                )
+                if trusted_match is not None:
                     return ApprovalDecision(
                         status="auto_approved",
                         category="trusted_file_operation",
                         reason=(
-                            f"File operation '{file_operation}' on '{file_path}' matched repeated "
-                            "successful supervised previews and is auto-approved."
+                            f"File operation '{file_operation}' on '{file_path}' matched "
+                            f"{trusted_match['matched_successes']} successful supervised previews "
+                            f"(threshold {trusted_match['required_successes']}) and is auto-approved."
                         ),
                         metadata={
                             "source": source,
                             "file_path": file_path,
                             "execution_task_title": task_title,
                             "trusted_preview": True,
+                            **trusted_match,
                         },
                         preview_patch=preview,
                     )
@@ -1010,13 +1030,13 @@ class LinuxPilotRuntime:
             task_title=str(task.metadata.get("title") or action.title),
         )
 
-    def _is_trusted_preview_write(
+    def _trusted_preview_write_match(
         self,
         *,
         file_operation: str,
         file_path: str,
         preview: PatchRunReport,
-    ) -> bool:
+    ) -> dict[str, Any] | None:
         normalized_path = str(file_path or "").strip()
         normalized_operation = str(file_operation or "").strip()
         if (
@@ -1024,17 +1044,19 @@ class LinuxPilotRuntime:
             or normalized_operation
             not in self.policy.trusted_auto_approve_file_operations
         ):
-            return False
+            return None
         if preview.status != "accepted":
-            return False
+            return None
         if list(preview.changed_files) != [normalized_path]:
-            return False
+            return None
 
         matches = 0
+        inspected_runs = 0
         for offset in range(12):
             patch_run = self.memory_store.latest_patch_run(offset=offset)
             if patch_run is None:
                 break
+            inspected_runs += 1
             if patch_run.get("status") != "applied" or not bool(patch_run.get("applied")):
                 continue
             if list(patch_run.get("changed_files") or []) != [normalized_path]:
@@ -1049,8 +1071,14 @@ class LinuxPilotRuntime:
                 continue
             matches += 1
             if matches >= self.policy.trusted_auto_approve_required_successes:
-                return True
-        return False
+                return {
+                    "trusted_operation": normalized_operation,
+                    "trusted_path": normalized_path,
+                    "matched_successes": matches,
+                    "required_successes": self.policy.trusted_auto_approve_required_successes,
+                    "history_window": inspected_runs,
+                }
+        return None
 
     def _execution_message(
         self,

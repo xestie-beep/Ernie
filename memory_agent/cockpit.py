@@ -673,7 +673,26 @@ COCKPIT_HTML = """<!doctype html>
     function summarizePilotCard(item) {
       const action = item.selected_action || {};
       const approval = item.approval || {};
+      if (approval.category === "trusted_file_operation") {
+        return summarizeTrustedApproval(approval) || approval.reason || action.summary || "Trusted pilot action.";
+      }
       return approval.prompt || approval.reason || action.summary || "Review this proposed pilot action before it runs.";
+    }
+
+    function summarizeTrustedApproval(approval) {
+      const metadata = approval?.metadata || {};
+      const operation = metadata.trusted_operation || metadata.file_path ? metadata.trusted_operation || "file edit" : "";
+      const path = metadata.trusted_path || metadata.file_path || "";
+      const matched = metadata.matched_successes;
+      const required = metadata.required_successes;
+      const pieces = [];
+      if (operation || path) {
+        pieces.push(`Trusted ${operation || "file edit"}${path ? ` on ${path}` : ""}.`);
+      }
+      if (matched && required) {
+        pieces.push(`Matched ${matched} successful supervised previews with a threshold of ${required}.`);
+      }
+      return pieces.join(" ");
     }
 
     function summarizePatchCard(run) {
@@ -749,10 +768,43 @@ COCKPIT_HTML = """<!doctype html>
       const localService = settings.local_service || {};
       const remoteService = settings.remote_service || {};
       const desktop = settings.desktop || {};
+      const pilotPolicy = settings.pilot_policy || {};
       const actions = settings.actions || [];
       const remoteUrl = remoteService.url || (remoteService.display_host && remoteService.port
         ? `http://${remoteService.display_host}:${remoteService.port}/`
         : "No browser URL configured.");
+      const trustedOps = pilotPolicy.trusted_auto_approve_file_operations || [];
+      const trustedThreshold = pilotPolicy.trusted_auto_approve_required_successes || 2;
+      const trustedEnabled = Boolean(pilotPolicy.trusted_writes_enabled);
+      const policyCard = `
+        <div class="card">
+          <div class="eyebrow">Pilot trusted writes</div>
+          <div class="headline">${trustedEnabled ? "Enabled" : "Disabled"}</div>
+          <div class="body">Policy file: ${pilotPolicy.policy_path || pilotPolicy.loaded_from || "workspace default"}</div>
+          <div class="body" style="margin-top:8px;">Operations: ${trustedOps.length ? trustedOps.join(", ") : "none"}</div>
+          <div class="body" style="margin-top:8px;">Success threshold: ${trustedThreshold}</div>
+          <div class="controls" style="margin-top:12px;">
+            <div>
+              <label for="trusted-write-enabled">Trusted low-risk writes</label>
+              <select id="trusted-write-enabled">
+                <option value="true"${trustedEnabled ? " selected" : ""}>enabled</option>
+                <option value="false"${trustedEnabled ? "" : " selected"}>disabled</option>
+              </select>
+            </div>
+            <div>
+              <label for="trusted-write-threshold">Required successful previews</label>
+              <input id="trusted-write-threshold" type="number" min="1" max="10" value="${trustedThreshold}">
+            </div>
+            <div>
+              <label for="trusted-write-operations">Trusted operations</label>
+              <input id="trusted-write-operations" value="${trustedOps.join(", ")}" placeholder="write_text, replace_text, append_text">
+            </div>
+            <div class="actions">
+              <button id="save-pilot-policy" class="ghost">Save pilot write policy</button>
+            </div>
+          </div>
+        </div>
+      `;
       const actionButtons = actions.length ? `
         <div class="card">
           <div class="eyebrow">Guided setup actions</div>
@@ -794,6 +846,7 @@ COCKPIT_HTML = """<!doctype html>
           <div class="body" style="margin-top:8px;">Launcher: ${desktop.launcher_installed ? "installed" : "missing"}</div>
           <div class="body" style="margin-top:8px;">Icon: ${desktop.icon_installed ? "installed" : "missing"}</div>
         </div>
+        ${policyCard}
         ${actionButtons}
       `;
       const rotate = document.getElementById("rotate-remote-token");
@@ -816,6 +869,37 @@ COCKPIT_HTML = """<!doctype html>
           await runSetupAction(action);
         });
       });
+      const savePilotPolicy = document.getElementById("save-pilot-policy");
+      if (savePilotPolicy) {
+        savePilotPolicy.addEventListener("click", async () => {
+          const enabled = document.getElementById("trusted-write-enabled").value === "true";
+          const threshold = Number(document.getElementById("trusted-write-threshold").value || trustedThreshold);
+          const operations = document.getElementById("trusted-write-operations").value
+            .split(",")
+            .map((item) => item.trim())
+            .filter(Boolean);
+          const payload = await requestJson("/api/settings/pilot-policy", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+              trusted_writes_enabled: enabled,
+              trusted_write_required_successes: threshold,
+              trusted_write_operations: operations
+            })
+          });
+          const updatedPolicy = payload.pilot_policy || {};
+          const summary = [
+            `Trusted writes ${updatedPolicy.trusted_writes_enabled ? "enabled" : "disabled"}.`,
+            `Threshold ${updatedPolicy.trusted_auto_approve_required_successes || threshold}.`,
+            (updatedPolicy.trusted_auto_approve_file_operations || []).length
+              ? `Operations: ${(updatedPolicy.trusted_auto_approve_file_operations || []).join(", ")}.`
+              : "No trusted write operations are active."
+          ].join(" ");
+          setActionBanner("success", "Pilot policy updated.", summary);
+          document.getElementById("execution-output").textContent = JSON.stringify(payload, null, 2);
+          await loadDashboard();
+        });
+      }
     }
 
     function renderOnboarding(settings) {
@@ -910,11 +994,30 @@ COCKPIT_HTML = """<!doctype html>
     function summarizePilotApproval(payload) {
       const outcome = payload?.execution_result || {};
       const action = payload?.selected_action || {};
+      const approval = payload?.approval || {};
       const pieces = [];
       if (action.title) pieces.push(`Approved "${action.title}".`);
       if (outcome.status) pieces.push(`Execution status: ${outcome.status}.`);
+      if (approval.category === "trusted_file_operation") {
+        pieces.push(summarizeTrustedApproval(approval));
+      }
       if (payload?.assistant_message) pieces.push(payload.assistant_message);
       return pieces.join(" ") || "Approved the pilot action and refreshed the queue.";
+    }
+
+    function summarizePilotPreview(payload) {
+      const approval = payload?.approval || {};
+      const action = payload?.selected_action || {};
+      if (approval.status === "needs_approval") {
+        return approval.prompt || approval.reason || `Review "${action.title || "the proposed action"}" before it runs.`;
+      }
+      if (approval.category === "trusted_file_operation") {
+        return summarizeTrustedApproval(approval) || approval.reason || "This pilot action was auto-approved by trusted preview history.";
+      }
+      if (approval.reason) {
+        return approval.reason;
+      }
+      return `Pilot preview recorded for "${action.title || "the proposed action"}".`;
     }
 
     function summarizePatchRollback(payload, runId) {
@@ -1320,6 +1423,9 @@ COCKPIT_HTML = """<!doctype html>
       const preview = approval.preview_patch || {};
       const changedFiles = (preview.changed_files || []).join(", ");
       const diffPreview = preview.diff_preview || "No diff preview recorded.";
+      const trustedSummary = approval.category === "trusted_file_operation"
+        ? summarizeTrustedApproval(approval)
+        : "";
       node.innerHTML = `
         <div class="card">
           <div class="status-line"><span class="eyebrow">pilot review</span>${renderStatePill(approval.status || "needs approval")}</div>
@@ -1334,6 +1440,11 @@ COCKPIT_HTML = """<!doctype html>
           <div class="eyebrow">Selected action</div>
           <div class="body">${action.kind || "unknown"} · ${action.summary || "No summary recorded."}</div>
           <div class="body" style="margin-top:8px;">${action.details || item.assistant_message || "No extra detail recorded."}</div>
+        </div>
+        <div class="card">
+          <div class="eyebrow">Approval rationale</div>
+          <div class="body">${trustedSummary || approval.reason || "No approval rationale recorded."}</div>
+          <div class="mono" style="margin-top:10px;">${JSON.stringify(approval.metadata || {}, null, 2)}</div>
         </div>
         <div class="card">
           <div class="eyebrow">Previewed change set</div>
@@ -1867,7 +1978,13 @@ COCKPIT_HTML = """<!doctype html>
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({text, limit: 5, use_model: false})
       });
-      setActionBanner("info", "Pilot preview ready.", "Review the approval queue and pilot detail panel before approving the proposed action.");
+      const approval = payload?.approval || {};
+      const title = approval.status === "needs_approval"
+        ? "Pilot preview ready."
+        : approval.status === "auto_approved"
+          ? "Pilot action auto-approved."
+          : "Pilot preview updated.";
+      setActionBanner("info", title, summarizePilotPreview(payload));
       document.getElementById("execution-output").textContent = JSON.stringify(payload, null, 2);
       document.getElementById("pilot-text").value = "";
       await loadDashboard();
@@ -2104,13 +2221,58 @@ class CockpitService:
         ]
 
     def settings(self) -> dict[str, Any]:
-        return self._jsonify(self.service_manager.settings())
+        payload = self.service_manager.settings()
+        payload["pilot_policy"] = self._pilot_policy_settings()
+        return self._jsonify(payload)
 
     def rotate_remote_access_token(self) -> dict[str, Any]:
         return self._jsonify(self.service_manager.rotate_remote_token())
 
     def service_action(self, action: str) -> dict[str, Any]:
         return self._jsonify(self.service_manager.perform_action(action))
+
+    def update_pilot_policy(
+        self,
+        *,
+        trusted_writes_enabled: bool | None = None,
+        trusted_write_operations: list[str] | None = None,
+        trusted_write_required_successes: int | None = None,
+    ) -> dict[str, Any]:
+        policy = LinuxPilotPolicy.load(workspace_root=self.workspace_root)
+        valid_operations = {"write_text", "replace_text", "append_text"}
+        current_operations = set(policy.trusted_auto_approve_file_operations)
+        operations = current_operations
+        if trusted_write_operations is not None:
+            operations = {
+                str(item).strip()
+                for item in trusted_write_operations
+                if str(item).strip()
+            }
+            unknown = sorted(item for item in operations if item not in valid_operations)
+            if unknown:
+                raise ValueError(f"unsupported_trusted_write_operations:{','.join(unknown)}")
+            operations = {item for item in operations if item in valid_operations}
+        if trusted_writes_enabled is False:
+            operations = set()
+        if trusted_writes_enabled is True and not operations:
+            operations = set(
+                LinuxPilotPolicy.default(
+                    workspace_root=self.workspace_root
+                ).trusted_auto_approve_file_operations
+            )
+        required_successes = policy.trusted_auto_approve_required_successes
+        if trusted_write_required_successes is not None:
+            if trusted_write_required_successes < 1 or trusted_write_required_successes > 10:
+                raise ValueError("trusted_write_required_successes_out_of_range")
+            required_successes = int(trusted_write_required_successes)
+        policy.trusted_auto_approve_file_operations = set(sorted(operations))
+        policy.trusted_auto_approve_required_successes = required_successes
+        written_to = policy.write()
+        self._reload_pilot_runtime()
+        return {
+            "written_to": str(written_to),
+            "pilot_policy": self._pilot_policy_settings(),
+        }
 
     def create_session(self, *, token: str) -> dict[str, Any]:
         expected = token.strip()
@@ -2123,6 +2285,30 @@ class CockpitService:
 
     def _configured_token(self) -> str:
         return str(getattr(self, "_configured_auth_token", "") or "")
+
+    def _reload_pilot_runtime(self) -> None:
+        self.pilot_policy = LinuxPilotPolicy.load(workspace_root=self.workspace_root)
+        self.pilot_runtime = LinuxPilotRuntime(self.store, policy=self.pilot_policy)
+        self.patch_runner = WorkspacePatchRunner(
+            self.store,
+            workspace_root=self.workspace_root,
+            git_mode=self.pilot_policy.git_write_mode,
+        )
+
+    def _pilot_policy_settings(self) -> dict[str, Any]:
+        policy_status = self.pilot_policy.status()
+        operations = list(policy_status.get("trusted_auto_approve_file_operations") or [])
+        return {
+            **policy_status,
+            "policy_path": str(self.pilot_policy.resolved_policy_path()),
+            "trusted_writes_enabled": bool(operations)
+            and int(policy_status.get("trusted_auto_approve_required_successes") or 0) > 0,
+            "trusted_write_supported_operations": [
+                "append_text",
+                "replace_text",
+                "write_text",
+            ],
+        }
 
     def _execution_cycle_to_json(self, cycle: ExecutionCycle) -> dict[str, Any]:
         return {
@@ -2377,6 +2563,42 @@ class CockpitRequestHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             except RuntimeError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if parsed.path == "/api/settings/pilot-policy":
+            trusted_writes_enabled = payload.get("trusted_writes_enabled")
+            if trusted_writes_enabled is not None:
+                trusted_writes_enabled = bool(trusted_writes_enabled)
+            raw_operations = payload.get("trusted_write_operations")
+            trusted_write_operations = None
+            if raw_operations is not None:
+                if not isinstance(raw_operations, list):
+                    self._send_error_json(
+                        HTTPStatus.BAD_REQUEST,
+                        "trusted_write_operations_must_be_list",
+                    )
+                    return
+                trusted_write_operations = [str(item) for item in raw_operations]
+            raw_threshold = payload.get("trusted_write_required_successes")
+            trusted_write_required_successes = None
+            if raw_threshold is not None:
+                try:
+                    trusted_write_required_successes = int(raw_threshold)
+                except (TypeError, ValueError):
+                    self._send_error_json(
+                        HTTPStatus.BAD_REQUEST,
+                        "trusted_write_required_successes_must_be_int",
+                    )
+                    return
+            try:
+                self._send_json(
+                    self.server.cockpit_service.update_pilot_policy(
+                        trusted_writes_enabled=trusted_writes_enabled,
+                        trusted_write_operations=trusted_write_operations,
+                        trusted_write_required_successes=trusted_write_required_successes,
+                    )
+                )
+            except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
         self._send_error_json(HTTPStatus.NOT_FOUND, "not_found")
