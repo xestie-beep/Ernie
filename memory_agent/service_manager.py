@@ -103,12 +103,71 @@ class CockpitServiceManager:
         else:
             raise ValueError(f"unsupported_service_action:{action}")
         refreshed = self.settings()
+        inspection_payload = self._inspection_payload(
+            normalized,
+            settings=refreshed,
+            meta=meta,
+        )
         return {
             "action": normalized,
             "meta": meta,
             "result": result,
             "message": str(meta.get("success_message") or "Action completed."),
             "settings": refreshed,
+            "inspection": inspection_payload["inspection"],
+            "verification_target": inspection_payload["verification_target"],
+        }
+
+    def inspect_action(self, action: str) -> dict[str, Any]:
+        normalized = action.strip().lower()
+        meta = self._action_details(normalized)
+        settings = self.settings()
+        inspection_payload = self._inspection_payload(
+            normalized,
+            settings=settings,
+            meta=meta,
+        )
+        return {
+            "action": normalized,
+            "meta": meta,
+            "inspection": inspection_payload["inspection"],
+            "verification_target": inspection_payload["verification_target"],
+            "settings": settings,
+        }
+
+    def _inspection_payload(
+        self,
+        action: str,
+        *,
+        settings: dict[str, Any],
+        meta: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized = action.strip().lower()
+        if normalized in {"install_local_service", "restart_local_service"}:
+            inspection = settings["local_service"]
+            verification_target = (
+                settings["onboarding"].get("local_url") or "http://127.0.0.1:8765/"
+            )
+        elif normalized in {"install_remote_service", "restart_remote_service"}:
+            inspection = settings["remote_service"]
+            verification_target = (
+                settings["onboarding"].get("remote_url")
+                or inspection.get("url")
+                or inspection.get("config_path")
+                or "remote service status"
+            )
+        elif normalized == "install_desktop_launcher":
+            inspection = settings["desktop"]
+            verification_target = (
+                settings["onboarding"].get("local_url")
+                or inspection.get("desktop_entry_path")
+            )
+        else:
+            raise ValueError(f"unsupported_service_action:{action}")
+        return {
+            "meta": meta,
+            "inspection": inspection,
+            "verification_target": verification_target,
         }
 
     def _load_remote_config(self) -> dict[str, Any]:

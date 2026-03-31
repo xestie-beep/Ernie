@@ -1064,24 +1064,24 @@ class MemoryImprovementEngine:
     def _strategic_backlog_opportunities(self) -> list[ImprovementOpportunity]:
         opportunities: list[ImprovementOpportunity] = []
         if self.memory_store.find_active_task(
-            "Add code-aware patching primitives",
+            "Add richer task orchestration",
             area="self_improvement",
         ) is None:
             opportunities.append(
                 ImprovementOpportunity(
-                    title="Add code-aware patching primitives",
+                    title="Add richer task orchestration",
                     summary=(
-                        "Build patch-style and batched code-editing primitives on top of the "
-                        "workspace file adapter so the agent can make safer multi-line code changes."
+                        "Extend the planner and executor with richer orchestration flows such as "
+                        "delegation, batching, retry policies, and broader tool adapters."
                     ),
                     score=0.74,
                     category="strategic_backlog",
                     details=(
-                        "This preserves the next major capability we planned before shifting "
-                        "into the self-improvement loop."
+                        "This keeps the self-improvement backlog aligned with the current roadmap "
+                        "instead of resurfacing capabilities that already shipped."
                     ),
-                    source="roadmap:code_aware_patching",
-                    metadata={"roadmap_item": "code_aware_patching"},
+                    source="roadmap:task_orchestration",
+                    metadata={"roadmap_item": "task_orchestration"},
                 )
             )
         return opportunities

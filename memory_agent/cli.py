@@ -204,6 +204,16 @@ def build_parser() -> argparse.ArgumentParser:
     task_parser.add_argument("--command", dest="task_command")
     task_parser.add_argument("--cwd")
     task_parser.add_argument(
+        "--service-action",
+        choices=[
+            "install_desktop_launcher",
+            "install_local_service",
+            "install_remote_service",
+            "restart_local_service",
+            "restart_remote_service",
+        ],
+    )
+    task_parser.add_argument(
         "--file-op",
         choices=[
             "read_text",
@@ -231,6 +241,8 @@ def build_parser() -> argparse.ArgumentParser:
     task_parser.add_argument("--symbol-name")
     task_parser.add_argument("--replace-all", action="store_true", default=None)
     task_parser.add_argument("--complete-on-success", action="store_true", default=None)
+    task_parser.add_argument("--retry-limit", type=int)
+    task_parser.add_argument("--retry-cooldown-minutes", type=int)
     task_parser.add_argument("--tags", nargs="*", default=[])
 
     decision_parser = subparsers.add_parser("decision", help="Record a structured decision.")
@@ -738,6 +750,7 @@ def main(argv: list[str] | None = None) -> int:
                 snoozed_until=args.snoozed_until,
                 command=args.task_command,
                 cwd=args.cwd,
+                service_action=args.service_action,
                 file_operation=args.file_op,
                 file_path=args.file_path,
                 file_text=args.file_text,
@@ -745,6 +758,8 @@ def main(argv: list[str] | None = None) -> int:
                 symbol_name=args.symbol_name,
                 replace_all=args.replace_all,
                 complete_on_success=args.complete_on_success,
+                retry_limit=args.retry_limit,
+                retry_cooldown_minutes=args.retry_cooldown_minutes,
                 tags=args.tags,
             )
             print(json.dumps(_memory_to_json(record), indent=2))

@@ -187,6 +187,9 @@ class ContextWindow:
         snoozed_until = str(task.metadata.get("snoozed_until") or "").strip()
         command = str(task.metadata.get("command") or "").strip()
         cwd = str(task.metadata.get("cwd") or "").strip()
+        service_action = str(task.metadata.get("service_action") or "").strip()
+        service_inspection = str(task.metadata.get("service_inspection") or "").strip()
+        service_label = str(task.metadata.get("service_label") or "").strip()
         file_operation = str(task.metadata.get("file_operation") or "").strip()
         file_path = str(task.metadata.get("file_path") or "").strip()
         symbol_name = str(task.metadata.get("symbol_name") or "").strip()
@@ -216,6 +219,12 @@ class ContextWindow:
             extras.append(f"cmd {command}")
         if cwd:
             extras.append(f"cwd {cwd}")
+        if service_action:
+            extras.append(f"service {service_label or service_action}")
+        if service_inspection:
+            extras.append(f"inspect {service_inspection}")
+        if bool(task.metadata.get("service_requires_confirmation", False)):
+            extras.append("confirm")
         if file_operation and file_path:
             extras.append(f"file {file_operation} {file_path}")
         if symbol_name:

@@ -533,5 +533,7 @@ python3 -m memory_agent.cli decide "What should I do next?" --preview
 ## Near-term roadmap
 
 - add model-backed extraction and reflection while keeping the heuristic path as the floor
+- add model-backed explanation, tutorial, and action-summary surfaces while keeping planner/executor state as the hard truth
 - add richer code-aware editing primitives beyond function/class replacement, such as insertion and rename-aware updates
 - add richer task orchestration such as delegation, batching, retry policies, and external tool adapters
+- see [docs/ERNIE_PLAN.md](docs/ERNIE_PLAN.md) for the current LLM rollout and whole-system next-step plan

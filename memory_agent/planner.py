@@ -8,6 +8,7 @@ from typing import Any
 from .improvement import PilotHistoryReporter
 from .memory import MemoryStore
 from .models import ContextWindow, MemoryRecord
+from .service_manager import CockpitServiceManager
 
 GENERIC_QUERY_TOKENS = {
     "a",
@@ -28,6 +29,12 @@ GENERIC_QUERY_TOKENS = {
     "what",
     "work",
 }
+RECENT_VERIFICATION_WINDOW_SECONDS_BY_SCOPE = {
+    "local_service": 600,
+    "remote_service": 1800,
+    "desktop_launcher": 1200,
+}
+DEFAULT_RECENT_VERIFICATION_WINDOW_SECONDS = 900
 
 
 @dataclass(slots=True)
@@ -84,8 +91,30 @@ class PlannerSnapshot:
 
 
 class MemoryPlanner:
-    def __init__(self, memory_store: MemoryStore):
+    def __init__(
+        self,
+        memory_store: MemoryStore,
+        *,
+        service_manager: CockpitServiceManager | None = None,
+        service_sync_suppression_window_seconds: dict[str, int] | None = None,
+    ):
         self.memory_store = memory_store
+        self.service_manager = service_manager or CockpitServiceManager()
+        self.service_sync_suppression_window_seconds = dict(
+            RECENT_VERIFICATION_WINDOW_SECONDS_BY_SCOPE
+        )
+        if service_sync_suppression_window_seconds:
+            for scope, raw_seconds in service_sync_suppression_window_seconds.items():
+                normalized_scope = str(scope).strip().lower()
+                if not normalized_scope:
+                    continue
+                try:
+                    seconds = int(raw_seconds)
+                except (TypeError, ValueError):
+                    continue
+                if seconds < 0:
+                    continue
+                self.service_sync_suppression_window_seconds[normalized_scope] = seconds
 
     def build_plan(
         self,
@@ -98,6 +127,7 @@ class MemoryPlanner:
         resolved_context = context or self.memory_store.build_context(plan_query)
         recent_nudges = self.memory_store.get_recent_nudges(limit=max(action_limit * 3, 8))
         maintenance = self.memory_store.maintenance_status()
+        maintenance["service_sync"] = self.service_sync_status()
         pilot_history = self._pilot_history_signals(limit=max(action_limit * 3, 8))
 
         candidates: list[PlannerAction] = []
@@ -118,7 +148,22 @@ class MemoryPlanner:
             )
         )
         candidates.extend(
+            self._build_delegation_actions(
+                plan_query,
+                resolved_context,
+                recent_nudges,
+            )
+        )
+        candidates.extend(
             self._build_ready_actions(
+                plan_query,
+                resolved_context,
+                recent_nudges,
+                pilot_history,
+            )
+        )
+        candidates.extend(
+            self._build_batch_actions(
                 plan_query,
                 resolved_context,
                 recent_nudges,
@@ -164,6 +209,21 @@ class MemoryPlanner:
             pilot_history=pilot_history,
         )
 
+    def service_sync_status(self, settings: dict[str, Any] | None = None) -> dict[str, Any]:
+        try:
+            service_sync_status = self.memory_store.service_sync_status(
+                settings if settings is not None else self.service_manager.settings()
+            )
+        except Exception:
+            service_sync_status = {
+                "due": False,
+                "recommended_actions": [],
+                "missing_titles": [],
+                "stale_titles": [],
+                "recommended_count": 0,
+            }
+        return self._suppress_recently_verified_service_sync(service_sync_status)
+
     def _build_preparation_actions(
         self,
         query: str,
@@ -172,8 +232,6 @@ class MemoryPlanner:
         pilot_history: dict[str, Any],
     ) -> list[PlannerAction]:
         approval_friction_count = int(pilot_history.get("approval_friction_count", 0) or 0)
-        if approval_friction_count < 2:
-            return []
 
         actions: list[PlannerAction] = []
         for task in context.ready_tasks:
@@ -184,13 +242,23 @@ class MemoryPlanner:
 
             task_title = str(task.metadata.get("title") or task.content)
             prep_title = self._preparation_task_title(task_title)
-            reasons = [
-                "prepare_for_safer_execution",
-                "approval_prone_task",
-                f"pilot_history=approval_friction({approval_friction_count})",
-            ]
+            confirmation_required = bool(
+                task.metadata.get("service_requires_confirmation", False)
+            )
+            if approval_friction_count < 2 and not confirmation_required:
+                continue
+
+            reasons = ["prepare_for_safer_execution", "approval_prone_task"]
             score = 0.78 + min(task.importance, 1.0) * 0.06
             evidence_ids = [task.id]
+
+            if confirmation_required:
+                score += 0.1
+                reasons.append("service_confirmation_required")
+            if approval_friction_count >= 2:
+                reasons.append(
+                    f"pilot_history=approval_friction({approval_friction_count})"
+                )
 
             if bool(task.metadata.get("overdue")):
                 score += 0.08
@@ -217,6 +285,9 @@ class MemoryPlanner:
                     task.subject,
                     str(task.metadata.get("details") or ""),
                     str(task.metadata.get("command") or ""),
+                    str(task.metadata.get("service_action") or ""),
+                    str(task.metadata.get("service_label") or ""),
+                    str(task.metadata.get("service_confirmation_message") or ""),
                     str(task.metadata.get("file_operation") or ""),
                     str(task.metadata.get("file_path") or ""),
                     "safer preparation split decomposition approval friction",
@@ -294,6 +365,9 @@ class MemoryPlanner:
                     task.subject,
                     str(task.metadata.get("details") or ""),
                     str(task.metadata.get("command") or ""),
+                    str(task.metadata.get("service_action") or ""),
+                    str(task.metadata.get("service_label") or ""),
+                    str(task.metadata.get("service_confirmation_message") or ""),
                     str(task.metadata.get("file_operation") or ""),
                     str(task.metadata.get("file_path") or ""),
                     " ".join(str(tag) for tag in task.tags),
@@ -315,6 +389,30 @@ class MemoryPlanner:
                         f"pilot_history_prefers_safe_execution({approval_friction_count})"
                     )
 
+            retry_limit = int(task.metadata.get("retry_limit", 0) or 0)
+            retry_count = int(task.metadata.get("retry_count", 0) or 0)
+            if retry_limit > 0 and retry_count > 0 and retry_count <= retry_limit:
+                score += min(0.08, 0.03 + (0.01 * retry_count))
+                reasons.append(f"retry_ready={retry_count}/{retry_limit}")
+
+            service_inspection = str(task.metadata.get("service_inspection") or "").strip()
+            task_tags = {str(tag).strip() for tag in task.tags if str(tag).strip()}
+            if service_inspection and "service-verification" in task_tags:
+                score += 0.18
+                reasons.append("post_action_verification")
+                if "post-action" in task_tags:
+                    score += 0.02
+                    reasons.append("verification_follow_up")
+
+            service_action = str(task.metadata.get("service_action") or "").strip()
+            if service_action:
+                if bool(task.metadata.get("service_requires_confirmation", False)):
+                    score -= 0.08
+                    reasons.append("service_confirmation_required")
+                else:
+                    score += 0.03
+                    reasons.append("service_low_friction")
+
             summary = f"Work on '{title}' now"
             if bool(task.metadata.get("overdue")):
                 summary += "; it is overdue and already ready to execute."
@@ -322,6 +420,7 @@ class MemoryPlanner:
                 summary += f"; it is ready and {due_reason.replace('_', ' ')}."
             else:
                 summary += "; it is ready without active blockers."
+            latest_prep_inspection = self._latest_prep_inspection_summary(task)
 
             actions.append(
                 PlannerAction(
@@ -336,6 +435,74 @@ class MemoryPlanner:
                         "area": task.subject,
                         "status": task.metadata.get("status"),
                         "due_date": task.metadata.get("due_date"),
+                        "latest_prep_inspection": latest_prep_inspection or None,
+                    },
+                )
+            )
+        return actions
+
+    def _build_delegation_actions(
+        self,
+        query: str,
+        context: ContextWindow,
+        recent_nudges: list[MemoryRecord],
+    ) -> list[PlannerAction]:
+        if not self._is_delegate_query(query):
+            return []
+
+        actions: list[PlannerAction] = []
+        for task in context.ready_tasks:
+            if self._has_active_delegation_task(task):
+                continue
+
+            task_title = str(task.metadata.get("title") or task.content)
+            delegate_title = self._delegation_task_title(task_title)
+            reasons = ["delegation_requested", "ready_now"]
+            score = 0.98 + min(task.importance, 1.0) * 0.06
+            evidence_ids = [task.id]
+
+            if bool(task.metadata.get("overdue")):
+                score += 0.08
+                reasons.append("overdue")
+
+            nudge = self._match_task_nudge(task, recent_nudges)
+            nudge_type = str(nudge.metadata.get("nudge_type", "")) if nudge is not None else ""
+            if nudge is not None and nudge_type in {"overdue_ready", "stale_ready"}:
+                score += 0.04
+                reasons.append(f"nudge={nudge_type}")
+                evidence_ids.append(nudge.id)
+
+            query_bonus, query_reason = self._query_bonus(
+                query,
+                [
+                    task_title,
+                    delegate_title,
+                    str(task.metadata.get("details") or ""),
+                    "delegate delegation handoff assign owner split",
+                ],
+            )
+            if query_bonus > 0.0:
+                score += min(0.08, query_bonus)
+                reasons.append(query_reason)
+
+            actions.append(
+                PlannerAction(
+                    kind="delegate_task",
+                    title=delegate_title,
+                    summary=(
+                        f"Delegate '{task_title}' into a tracked child task so the parent "
+                        "work can route through that handoff."
+                    ),
+                    score=score,
+                    reasons=reasons,
+                    task_id=task.id,
+                    evidence_memory_ids=list(dict.fromkeys(evidence_ids)),
+                    metadata={
+                        "area": task.subject,
+                        "status": task.metadata.get("status"),
+                        "target_task_title": task_title,
+                        "delegate_task_title": delegate_title,
+                        "delegate_task_details": self._delegation_task_details(task),
                     },
                 )
             )
@@ -448,6 +615,105 @@ class MemoryPlanner:
             )
         return actions
 
+    def _build_batch_actions(
+        self,
+        query: str,
+        context: ContextWindow,
+        recent_nudges: list[MemoryRecord],
+        pilot_history: dict[str, Any],
+    ) -> list[PlannerAction]:
+        if not self._is_batch_query(query):
+            return []
+
+        safe_tasks = [
+            task for task in context.ready_tasks if self._is_batch_safe_task(task)
+        ]
+        if len(safe_tasks) < 2:
+            return []
+        safe_tasks.sort(
+            key=lambda task: (
+                str(task.metadata.get("due_date") or ""),
+                str(task.created_at or ""),
+                str(task.metadata.get("title") or task.content),
+            )
+        )
+
+        selected_tasks = safe_tasks[:3]
+        task_titles = [
+            str(task.metadata.get("title") or task.content)
+            for task in selected_tasks
+        ]
+        reasons = [
+            "batch_requested",
+            "safe_ready_batch",
+            f"task_count={len(selected_tasks)}",
+        ]
+        evidence_ids = [task.id for task in selected_tasks]
+        score = 0.96 + min(0.02, 0.01 * max(len(selected_tasks) - 2, 0))
+
+        overdue_count = sum(
+            1 for task in selected_tasks if bool(task.metadata.get("overdue"))
+        )
+        if overdue_count:
+            score += min(0.05, overdue_count * 0.02)
+            reasons.append(f"overdue_tasks={overdue_count}")
+
+        nudged_count = 0
+        for task in selected_tasks:
+            nudge = self._match_task_nudge(task, recent_nudges)
+            if nudge is None:
+                continue
+            nudge_type = str(nudge.metadata.get("nudge_type", "") or "").strip()
+            if nudge_type not in {"overdue_ready", "stale_ready"}:
+                continue
+            nudged_count += 1
+            evidence_ids.append(nudge.id)
+        if nudged_count:
+            score += min(0.04, nudged_count * 0.02)
+            reasons.append(f"nudged_tasks={nudged_count}")
+
+        query_bonus, query_reason = self._query_bonus(
+            query,
+            [
+                "batch multiple together sweep all ready tasks",
+                *task_titles,
+                *[
+                    str(task.metadata.get("details") or "")
+                    for task in selected_tasks
+                ],
+            ],
+        )
+        if query_bonus > 0.0:
+            score += min(0.08, query_bonus)
+            reasons.append(query_reason)
+
+        approval_friction_count = int(pilot_history.get("approval_friction_count", 0) or 0)
+        if approval_friction_count:
+            score += min(0.03, 0.01 * min(approval_friction_count, 3))
+            reasons.append(
+                f"pilot_history_prefers_safe_batch({approval_friction_count})"
+            )
+
+        preview_titles = ", ".join(task_titles[:2])
+        if len(task_titles) > 2:
+            preview_titles += ", ..."
+        return [
+            PlannerAction(
+                kind="batch_ready_tasks",
+                title="Batch safe ready tasks",
+                summary=(
+                    f"Run a safe batch of ready tasks next: {preview_titles}."
+                ),
+                score=score,
+                reasons=reasons,
+                evidence_memory_ids=list(dict.fromkeys(evidence_ids)),
+                metadata={
+                    "task_ids": [task.id for task in selected_tasks],
+                    "task_titles": task_titles,
+                },
+            )
+        ]
+
     def _build_maintenance_actions(
         self,
         query: str,
@@ -476,9 +742,18 @@ class MemoryPlanner:
             score += min(0.12, pending_nudges * 0.03)
             reasons.append(f"pending_nudges={pending_nudges}")
 
+        service_sync = maintenance.get("service_sync", {})
+        recommended_count = int(service_sync.get("recommended_count", 0) or 0)
+        if recommended_count:
+            score += min(0.12, 0.04 * recommended_count)
+            reasons.append(f"service_sync_recommended={recommended_count}")
+
         query_bonus, query_reason = self._query_bonus(
             query,
-            [" ".join(due_names), "maintenance memory upkeep reflection profile contradictions"],
+            [
+                " ".join(due_names),
+                "maintenance memory upkeep reflection profile contradictions cockpit service setup remote local launcher",
+            ],
         )
         if query_bonus > 0.0:
             score += query_bonus
@@ -563,6 +838,12 @@ class MemoryPlanner:
         command = str(task.metadata.get("command") or "").strip()
         if command:
             return "shell_command"
+        service_action = str(task.metadata.get("service_action") or "").strip()
+        if service_action:
+            return f"service_action:{service_action}"
+        service_inspection = str(task.metadata.get("service_inspection") or "").strip()
+        if service_inspection:
+            return f"service_inspection:{service_inspection}"
         file_operation = str(task.metadata.get("file_operation") or "").strip()
         if file_operation:
             return f"file_operation:{file_operation}"
@@ -570,9 +851,15 @@ class MemoryPlanner:
 
     def _likely_pilot_gated_task(self, task: MemoryRecord) -> bool:
         command = str(task.metadata.get("command") or "").strip()
+        service_action = str(task.metadata.get("service_action") or "").strip()
+        service_inspection = str(task.metadata.get("service_inspection") or "").strip()
         file_operation = str(task.metadata.get("file_operation") or "").strip()
         if command:
             return True
+        if service_action:
+            return True
+        if service_inspection:
+            return False
         if not file_operation:
             return False
         return file_operation != "read_text"
@@ -584,6 +871,18 @@ class MemoryPlanner:
         if prep_task is None:
             return False
         return str(prep_task.metadata.get("status", "open")) != "done"
+
+    def _has_active_delegation_task(self, task: MemoryRecord) -> bool:
+        task_title = str(task.metadata.get("title") or task.content)
+        delegate_title = self._delegation_task_title(task_title)
+        delegate_task = self.memory_store.find_active_task(
+            delegate_title,
+            area=task.subject,
+            decorate=True,
+        )
+        if delegate_task is None:
+            return False
+        return str(delegate_task.metadata.get("status", "open")) != "done"
 
     def _is_direct_preparation_blocker(self, blocker_title: str, area: str) -> bool:
         clean_title = str(blocker_title).strip()
@@ -597,9 +896,17 @@ class MemoryPlanner:
     def _preparation_task_title(self, task_title: str) -> str:
         return f"Prepare safer execution for {task_title}"
 
+    def _delegation_task_title(self, task_title: str) -> str:
+        return f"Delegate work for {task_title}"
+
     def _preparation_task_details(self, task: MemoryRecord) -> str:
         task_title = str(task.metadata.get("title") or task.content)
         command = str(task.metadata.get("command") or "").strip()
+        service_action = str(task.metadata.get("service_action") or "").strip()
+        service_label = str(task.metadata.get("service_label") or "").strip()
+        service_confirmation_message = str(
+            task.metadata.get("service_confirmation_message") or ""
+        ).strip()
         file_operation = str(task.metadata.get("file_operation") or "").strip()
         file_path = str(task.metadata.get("file_path") or "").strip()
         if command:
@@ -615,9 +922,254 @@ class MemoryPlanner:
                 f"'{file_operation}' operation on '{file_path}' into the smallest reviewed change, "
                 "and stage a read-only or low-risk prep step before the main edit."
             )
+        if service_action:
+            action_label = service_label or service_action
+            verification_target = (
+                "the remote access path"
+                if "remote" in service_action
+                else "the local cockpit service"
+            )
+            checklist = [
+                f"1. Inspect current service state for '{action_label}' and confirm the exact target unit or installer path.",
+                f"2. Capture the approval-sensitive change for '{action_label}' before execution."
+                + (
+                    f" Confirmation text: {service_confirmation_message}"
+                    if service_confirmation_message
+                    else ""
+                ),
+                f"3. Define the post-action verification for {verification_target}, including the status signal or URL that should be checked immediately after the live change.",
+            ]
+            return (
+                f"Recurring pilot approval friction suggests splitting '{task_title}' into "
+                f"a smaller, reviewable service step before running '{service_action}'. "
+                + " ".join(checklist)
+            )
         return (
             f"Recurring pilot approval friction suggests breaking '{task_title}' into a "
             "safer preparation step before the main execution path runs again."
+        )
+
+    def _latest_prep_inspection_summary(self, task: MemoryRecord) -> str:
+        details = str(task.metadata.get("details") or "").strip()
+        if not details:
+            return ""
+        prefix = "Latest prep inspection:"
+        for line in reversed(details.splitlines()):
+            clean_line = line.strip()
+            if clean_line.startswith(prefix):
+                return clean_line[len(prefix):].strip()
+        return ""
+
+    def _suppress_recently_verified_service_sync(
+        self,
+        service_sync_status: dict[str, Any],
+    ) -> dict[str, Any]:
+        recommended_actions = [
+            str(item).strip()
+            for item in service_sync_status.get("recommended_actions", [])
+            if str(item).strip()
+        ]
+        if not recommended_actions:
+            return {
+                **service_sync_status,
+                "suppressed_recent_verification_scopes": [],
+                "suppressed_recent_verification_actions": [],
+                "suppressed_recent_verification_titles": [],
+                "suppressed_recent_verification_updated_at": None,
+                "suppressed_recent_verification_age_seconds": None,
+                "suppressed_recent_verification_expires_in_seconds": None,
+            }
+        recent_outcomes = self.memory_store.get_recent_tool_outcomes(
+            limit=8,
+            statuses=("success",),
+            tool_name="service_manager",
+        )
+        verified_scopes: set[str] = set()
+        resolved_titles_by_scope: dict[str, list[str]] = {}
+        freshest_recent_verification: tuple[datetime, str] | None = None
+        for outcome in recent_outcomes:
+            if not bool(outcome.metadata.get("service_inspection_healthy")):
+                continue
+            scope = self._service_verification_scope(
+                str(outcome.metadata.get("service_inspection") or "")
+            )
+            recent_timestamp = self._recent_verification_timestamp(outcome, scope=scope)
+            if recent_timestamp is None:
+                continue
+            if scope:
+                verified_scopes.add(scope)
+                if (
+                    freshest_recent_verification is None
+                    or recent_timestamp > freshest_recent_verification[0]
+                ):
+                    freshest_recent_verification = (recent_timestamp, scope)
+                resolved_titles_by_scope.setdefault(scope, []).extend(
+                    [
+                        str(item).strip()
+                        for item in outcome.metadata.get("resolved_service_sync_titles", [])
+                        if str(item).strip()
+                    ]
+                )
+        if not verified_scopes:
+            return {
+                **service_sync_status,
+                "suppressed_recent_verification_scopes": [],
+                "suppressed_recent_verification_actions": [],
+                "suppressed_recent_verification_titles": [],
+                "suppressed_recent_verification_updated_at": None,
+                "suppressed_recent_verification_age_seconds": None,
+                "suppressed_recent_verification_expires_in_seconds": None,
+            }
+        filtered_actions = [
+            action_name
+            for action_name in recommended_actions
+            if self._service_verification_scope(action_name) not in verified_scopes
+        ]
+        if len(filtered_actions) == len(recommended_actions):
+            return {
+                **service_sync_status,
+                "suppressed_recent_verification_scopes": sorted(verified_scopes),
+                "suppressed_recent_verification_actions": [],
+                "suppressed_recent_verification_titles": [],
+                **self._recent_verification_metadata(freshest_recent_verification),
+            }
+        suppressed_actions = [
+            action_name
+            for action_name in recommended_actions
+            if self._service_verification_scope(action_name) in verified_scopes
+        ]
+        missing_titles = [
+            str(item).strip()
+            for item in service_sync_status.get("missing_titles", [])
+            if str(item).strip()
+            and self._service_verification_scope_from_title(str(item).strip())
+            not in verified_scopes
+        ]
+        suppressed_titles = [
+            str(item).strip()
+            for item in service_sync_status.get("missing_titles", [])
+            if str(item).strip()
+            and self._service_verification_scope_from_title(str(item).strip())
+            in verified_scopes
+        ]
+        stale_titles = [
+            str(item).strip()
+            for item in service_sync_status.get("stale_titles", [])
+            if str(item).strip()
+            and self._service_verification_scope_from_title(str(item).strip())
+            not in verified_scopes
+        ]
+        suppressed_titles.extend(
+            [
+                str(item).strip()
+                for item in service_sync_status.get("stale_titles", [])
+                if str(item).strip()
+                and self._service_verification_scope_from_title(str(item).strip())
+                in verified_scopes
+            ]
+        )
+        for scope, titles in resolved_titles_by_scope.items():
+            if scope not in verified_scopes:
+                continue
+            for title in titles:
+                if title not in suppressed_titles:
+                    suppressed_titles.append(title)
+        return {
+            **service_sync_status,
+            "due": bool(missing_titles or stale_titles),
+            "recommended_actions": filtered_actions,
+            "missing_titles": missing_titles,
+            "stale_titles": stale_titles,
+            "recommended_count": len(filtered_actions),
+            "suppressed_recent_verification_scopes": sorted(verified_scopes),
+            "suppressed_recent_verification_actions": suppressed_actions,
+            "suppressed_recent_verification_titles": suppressed_titles,
+            **self._recent_verification_metadata(freshest_recent_verification),
+        }
+
+    def _is_recent_verification_outcome(self, outcome: MemoryRecord) -> bool:
+        for scope in self.service_sync_suppression_window_seconds:
+            if self._recent_verification_timestamp(outcome, scope=scope) is not None:
+                return True
+        return self._recent_verification_timestamp(outcome) is not None
+
+    def _recent_verification_timestamp(
+        self,
+        outcome: MemoryRecord,
+        *,
+        scope: str | None = None,
+    ) -> datetime | None:
+        updated_at = str(outcome.updated_at or "").strip()
+        if not updated_at:
+            return None
+        try:
+            timestamp = datetime.fromisoformat(updated_at)
+        except ValueError:
+            return None
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        window_seconds = self._recent_verification_window_seconds(scope)
+        if (datetime.now(timezone.utc) - timestamp).total_seconds() > window_seconds:
+            return None
+        return timestamp
+
+    def _recent_verification_metadata(
+        self,
+        recent_verification: tuple[datetime, str] | None,
+    ) -> dict[str, Any]:
+        if recent_verification is None:
+            return {
+                "suppressed_recent_verification_updated_at": None,
+                "suppressed_recent_verification_age_seconds": None,
+                "suppressed_recent_verification_expires_in_seconds": None,
+            }
+        timestamp, scope = recent_verification
+        age_seconds = max(
+            0,
+            int((datetime.now(timezone.utc) - timestamp).total_seconds()),
+        )
+        expires_in_seconds = max(
+            0,
+            self._recent_verification_window_seconds(scope) - age_seconds,
+        )
+        return {
+            "suppressed_recent_verification_updated_at": timestamp.isoformat(),
+            "suppressed_recent_verification_age_seconds": age_seconds,
+            "suppressed_recent_verification_expires_in_seconds": expires_in_seconds,
+        }
+
+    def _recent_verification_window_seconds(self, scope: str | None) -> int:
+        normalized = str(scope or "").strip().lower()
+        return self.service_sync_suppression_window_seconds.get(
+            normalized,
+            DEFAULT_RECENT_VERIFICATION_WINDOW_SECONDS,
+        )
+
+    def _service_verification_scope(self, action_name: str) -> str:
+        normalized = str(action_name or "").strip().lower()
+        if normalized in {"install_local_service", "restart_local_service"}:
+            return "local_service"
+        if normalized in {"install_remote_service", "restart_remote_service"}:
+            return "remote_service"
+        if normalized == "install_desktop_launcher":
+            return "desktop_launcher"
+        return normalized
+
+    def _service_verification_scope_from_title(self, title: str) -> str:
+        normalized = str(title or "").strip().lower()
+        if "remote" in normalized:
+            return "remote_service"
+        if "local" in normalized:
+            return "local_service"
+        if "desktop" in normalized or "launcher" in normalized:
+            return "desktop_launcher"
+        return normalized
+
+    def _delegation_task_details(self, task: MemoryRecord) -> str:
+        task_title = str(task.metadata.get("title") or task.content)
+        return (
+            f"Create a delegated handoff for '{task_title}', capture the owner and expected "
+            "deliverable, and route the parent task through that delegated child until it is complete."
         )
 
     def _match_task_nudge(
@@ -656,6 +1208,45 @@ class MemoryPlanner:
             for token in self._tokenize(query)
             if token not in GENERIC_QUERY_TOKENS
         }
+
+    def _is_batch_query(self, query: str) -> bool:
+        query_tokens = self._query_tokens(query)
+        if not query_tokens:
+            return False
+        return bool(
+            query_tokens
+            & {
+                "all",
+                "batch",
+                "batching",
+                "multiple",
+                "several",
+                "sweep",
+                "together",
+            }
+        )
+
+    def _is_delegate_query(self, query: str) -> bool:
+        query_tokens = self._query_tokens(query)
+        if not query_tokens:
+            return False
+        return bool(
+            query_tokens
+            & {"assign", "delegate", "delegation", "handoff", "offload"}
+        )
+
+    def _is_batch_safe_task(self, task: MemoryRecord) -> bool:
+        if self._likely_pilot_gated_task(task):
+            return False
+        command = str(task.metadata.get("command") or "").strip()
+        service_action = str(task.metadata.get("service_action") or "").strip()
+        service_inspection = str(task.metadata.get("service_inspection") or "").strip()
+        file_operation = str(task.metadata.get("file_operation") or "").strip()
+        if command or service_action:
+            return False
+        if service_inspection:
+            return True
+        return not file_operation or file_operation == "read_text"
 
     def _tokenize(self, text: str) -> set[str]:
         return {match.group(0).lower() for match in re.finditer(r"[a-z0-9_]+", text.lower())}

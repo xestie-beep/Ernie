@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .file_adapter import FileOperationResult, WorkspaceFileAdapter
@@ -8,6 +9,7 @@ from .memory import MemoryStore
 from .models import MemoryRecord
 from .patch_runner import PatchRunReport
 from .planner import MemoryPlanner, PlannerAction, PlannerSnapshot
+from .service_manager import CockpitServiceManager
 from .shell_adapter import GuardedShellAdapter, ShellExecutionResult
 
 
@@ -71,9 +73,11 @@ class MemoryExecutor:
         *,
         shell_adapter: GuardedShellAdapter | None = None,
         file_adapter: WorkspaceFileAdapter | None = None,
+        service_manager: CockpitServiceManager | None = None,
     ):
         self.memory_store = memory_store
-        self.planner = MemoryPlanner(memory_store)
+        self.service_manager = service_manager or CockpitServiceManager()
+        self.planner = MemoryPlanner(memory_store, service_manager=self.service_manager)
         self.shell_adapter = shell_adapter or GuardedShellAdapter()
         self.file_adapter = file_adapter or WorkspaceFileAdapter()
 
@@ -104,6 +108,10 @@ class MemoryExecutor:
             )
         if action.kind == "work_task":
             return self._execute_work_task(action)
+        if action.kind == "batch_ready_tasks":
+            return self._execute_batch_ready_tasks(action)
+        if action.kind == "delegate_task":
+            return self._execute_delegate_task(action)
         if action.kind == "prepare_task":
             return self._execute_prepare_task(action)
         if action.kind == "resolve_blocker":
@@ -152,11 +160,23 @@ class MemoryExecutor:
             )
 
         command = str(task.metadata.get("command") or "").strip()
+        service_action = str(task.metadata.get("service_action") or "").strip()
+        service_inspection = str(task.metadata.get("service_inspection") or "").strip()
         file_operation = str(task.metadata.get("file_operation") or "").strip()
-        if command and file_operation:
+        configured_modes = [
+            bool(command),
+            bool(service_action),
+            bool(service_inspection),
+            bool(file_operation),
+        ]
+        if sum(1 for item in configured_modes if item) > 1:
             return self._execute_ambiguous_execution_metadata(action, task)
         if file_operation:
             return self._execute_task_file_operation(action, task, file_operation)
+        if service_action:
+            return self._execute_task_service_action(action, task, service_action)
+        if service_inspection:
+            return self._execute_task_service_inspection(action, task, service_inspection)
         if command:
             return self._execute_task_command(action, task, command)
 
@@ -192,6 +212,107 @@ class MemoryExecutor:
             metadata={"task_status": updated_task.metadata.get("status")},
         )
 
+    def _execute_batch_ready_tasks(self, action: PlannerAction) -> ExecutorResult:
+        batch_tasks = self._resolve_batch_tasks(action)
+        if not batch_tasks:
+            return self._execute_ask_user(
+                PlannerAction(
+                    kind="ask_user",
+                    title="Missing tasks for ready batch",
+                    summary=(
+                        "I could not resolve the ready-task batch that was selected for execution."
+                    ),
+                    score=action.score,
+                    reasons=["task_batch_missing", *action.reasons],
+                    metadata=dict(action.metadata),
+                )
+            )
+
+        batch_results: list[dict[str, Any]] = []
+        last_task_update: MemoryRecord | None = None
+        last_related_task: MemoryRecord | None = None
+
+        for task in batch_tasks:
+            title = str(task.metadata.get("title") or task.content)
+            follow_up = PlannerAction(
+                kind="work_task",
+                title=title,
+                summary=f"Work on '{title}' now as part of the current safe ready batch.",
+                score=action.score,
+                reasons=["batched_execution", *action.reasons],
+                task_id=task.id,
+                evidence_memory_ids=list(action.evidence_memory_ids),
+                metadata={"area": task.subject},
+            )
+            result = self._execute_work_task(follow_up)
+            batch_results.append(
+                {
+                    "title": title,
+                    "executed_kind": result.executed_kind,
+                    "status": result.status,
+                    "summary": result.summary,
+                }
+            )
+            if result.task_update is not None:
+                last_task_update = result.task_update
+            if result.related_task is not None:
+                last_related_task = result.related_task
+            if result.status not in {"success", "noop"}:
+                tool_outcome = self.memory_store.record_tool_outcome(
+                    "executor",
+                    (
+                        f"Ready-task batch stalled on '{title}' with status "
+                        f"{result.status}: {result.summary}"
+                    ),
+                    status=result.status,
+                    subject=task.subject,
+                    tags=["executor", "batch_ready_tasks", result.status],
+                    metadata={
+                        "batch_results": batch_results,
+                        "stalled_task_title": title,
+                    },
+                )
+                return ExecutorResult(
+                    requested_action=action,
+                    executed_kind="batch_ready_tasks",
+                    status=result.status,
+                    summary=(
+                        f"Ready-task batch stalled on '{title}' after {len(batch_results) - 1} "
+                        "successful step(s)."
+                    ),
+                    reasons=list(action.reasons),
+                    tool_outcome=tool_outcome,
+                    task_update=last_task_update,
+                    related_task=last_related_task or task,
+                    prompt=result.prompt,
+                    metadata={"batch_results": batch_results},
+                )
+
+        tool_outcome = self.memory_store.record_tool_outcome(
+            "executor",
+            (
+                f"Ran ready-task batch: {', '.join(item['title'] for item in batch_results)}"
+            ),
+            status="success",
+            subject="execution",
+            tags=["executor", "batch_ready_tasks", "success"],
+            metadata={"batch_results": batch_results},
+        )
+        return ExecutorResult(
+            requested_action=action,
+            executed_kind="batch_ready_tasks",
+            status="success",
+            summary=(
+                f"Ran a safe batch of {len(batch_results)} ready task(s): "
+                f"{', '.join(item['title'] for item in batch_results)}."
+            ),
+            reasons=list(action.reasons),
+            tool_outcome=tool_outcome,
+            task_update=last_task_update,
+            related_task=last_related_task,
+            metadata={"batch_results": batch_results},
+        )
+
     def _execute_prepare_task(self, action: PlannerAction) -> ExecutorResult:
         target_task = self._resolve_task(action)
         if target_task is None:
@@ -225,6 +346,16 @@ class MemoryExecutor:
                 owner="agent",
                 details=prep_details or None,
                 due_date=target_task.metadata.get("due_date"),
+                service_inspection=target_task.metadata.get("service_action"),
+                service_label=target_task.metadata.get("service_label"),
+                service_requires_confirmation=bool(
+                    target_task.metadata.get("service_requires_confirmation", False)
+                ),
+                service_confirmation_message=target_task.metadata.get(
+                    "service_confirmation_message"
+                ),
+                service_success_message=target_task.metadata.get("service_success_message"),
+                complete_on_success=True,
                 tags=["pilot-prep", "safer-execution"],
                 importance=min(max(target_task.importance + 0.02, 0.78), 0.96),
                 confidence=0.9,
@@ -315,6 +446,152 @@ class MemoryExecutor:
             },
         )
 
+    def _execute_delegate_task(self, action: PlannerAction) -> ExecutorResult:
+        target_task = self._resolve_task(action)
+        if target_task is None:
+            missing_title = str(action.metadata.get("target_task_title") or action.title)
+            return self._execute_ask_user(
+                PlannerAction(
+                    kind="ask_user",
+                    title=f"Missing task for {missing_title}",
+                    summary=f"I could not find the task '{missing_title}' to delegate.",
+                    score=action.score,
+                    reasons=["task_missing", *action.reasons],
+                    metadata=dict(action.metadata),
+                )
+            )
+
+        target_title = str(
+            target_task.metadata.get("title")
+            or action.metadata.get("target_task_title")
+            or action.title
+        )
+        delegate_title = str(
+            action.metadata.get("delegate_task_title")
+            or f"Delegate work for {target_title}"
+        )
+        delegate_details = str(action.metadata.get("delegate_task_details") or "").strip()
+        existing_delegate = self.memory_store.find_active_task(
+            delegate_title,
+            area=target_task.subject,
+            decorate=True,
+        )
+
+        if existing_delegate is not None and str(existing_delegate.metadata.get("status", "open")) != "done":
+            delegate_task = existing_delegate
+            created_delegate = False
+        else:
+            delegate_task = self.memory_store.record_task(
+                delegate_title,
+                status="open",
+                area=target_task.subject,
+                owner="delegate",
+                details=delegate_details or None,
+                due_date=target_task.metadata.get("due_date"),
+                tags=["delegated", "handoff"],
+                importance=min(max(target_task.importance, 0.78), 0.95),
+                confidence=0.9,
+            )
+            created_delegate = True
+
+        blocked_by = list(
+            dict.fromkeys(
+                [
+                    str(item).strip()
+                    for item in target_task.metadata.get("blocked_by", [])
+                    if str(item).strip()
+                ]
+                + [delegate_title]
+            )
+        )
+        depends_on = list(
+            dict.fromkeys(
+                [
+                    str(item).strip()
+                    for item in target_task.metadata.get("depends_on", [])
+                    if str(item).strip()
+                ]
+                + [delegate_title]
+            )
+        )
+
+        if (
+            str(target_task.metadata.get("status", "open")) == "blocked"
+            and blocked_by == list(target_task.metadata.get("blocked_by", []))
+            and depends_on == list(target_task.metadata.get("depends_on", []))
+        ):
+            updated_target = target_task
+        else:
+            updated_target = self.memory_store.record_task(
+                target_title,
+                status="blocked",
+                area=target_task.subject,
+                owner=str(target_task.metadata.get("owner") or "agent"),
+                details=target_task.metadata.get("details"),
+                depends_on=depends_on,
+                blocked_by=blocked_by,
+                due_date=target_task.metadata.get("due_date"),
+                recurrence_days=target_task.metadata.get("recurrence_days"),
+                snoozed_until=target_task.metadata.get("snoozed_until"),
+                command=target_task.metadata.get("command"),
+                cwd=target_task.metadata.get("cwd"),
+                service_action=target_task.metadata.get("service_action"),
+                file_operation=target_task.metadata.get("file_operation"),
+                file_path=target_task.metadata.get("file_path"),
+                file_text=target_task.metadata.get("file_text"),
+                find_text=target_task.metadata.get("find_text"),
+                symbol_name=target_task.metadata.get("symbol_name"),
+                replace_all=bool(target_task.metadata.get("replace_all", False)),
+                complete_on_success=bool(target_task.metadata.get("complete_on_success", False)),
+                retry_limit=target_task.metadata.get("retry_limit"),
+                retry_count=target_task.metadata.get("retry_count"),
+                retry_cooldown_minutes=target_task.metadata.get("retry_cooldown_minutes"),
+                last_retry_at=target_task.metadata.get("last_retry_at"),
+                last_failure_at=target_task.metadata.get("last_failure_at"),
+                importance=target_task.importance,
+                confidence=target_task.confidence,
+            )
+
+        if created_delegate:
+            outcome_text = (
+                f"Created delegated task '{delegate_title}' for '{target_title}' and routed the parent through it"
+            )
+            summary = (
+                f"Created delegated task '{delegate_title}' and routed '{target_title}' through that handoff."
+            )
+        else:
+            outcome_text = f"Kept delegated task '{delegate_title}' linked to '{target_title}'"
+            summary = (
+                f"'{target_title}' already has delegated child task '{delegate_title}', so the parent stays routed through it."
+            )
+
+        tool_outcome = self.memory_store.record_tool_outcome(
+            "executor",
+            outcome_text,
+            status="success",
+            subject=target_task.subject,
+            tags=["executor", "delegate_task"],
+            metadata={
+                "target_task_title": target_title,
+                "delegate_task_title": delegate_title,
+            },
+        )
+        return ExecutorResult(
+            requested_action=action,
+            executed_kind="delegate_task",
+            status="success",
+            summary=summary,
+            reasons=list(action.reasons),
+            tool_outcome=tool_outcome,
+            task_update=updated_target,
+            related_task=delegate_task,
+            metadata={
+                "target_task_title": target_title,
+                "delegate_task_title": delegate_title,
+                "created_delegate": created_delegate,
+            },
+        )
+
     def _execute_ambiguous_execution_metadata(
         self,
         action: PlannerAction,
@@ -387,15 +664,7 @@ class MemoryExecutor:
             )
 
         if shell_result.status == "error":
-            updated_task = (
-                task
-                if str(task.metadata.get("status", "open")) == "in_progress"
-                else self.memory_store.record_task(
-                    action.title,
-                    status="in_progress",
-                    area=task.subject,
-                )
-            )
+            updated_task, retry_scheduled, retry_metadata = self._record_task_error_state(task)
             tool_outcome = self.memory_store.record_tool_outcome(
                 "shell",
                 self._shell_outcome_text(action.title, shell_result),
@@ -407,11 +676,19 @@ class MemoryExecutor:
                 requested_action=action,
                 executed_kind="run_shell",
                 status="error",
-                summary=(
-                    f"Command for '{action.title}' failed with "
-                    f"{shell_result.reason or 'an error'}."
+                summary=self._retry_error_summary(
+                    action.title,
+                    failure_kind="Command",
+                    failure_reason=shell_result.reason,
+                    retry_scheduled=retry_scheduled,
+                    retry_metadata=retry_metadata,
                 ),
-                reasons=["shell_error", shell_result.reason, *action.reasons],
+                reasons=[
+                    "shell_error",
+                    shell_result.reason,
+                    *(["retry_scheduled"] if retry_scheduled else []),
+                    *action.reasons,
+                ],
                 tool_outcome=tool_outcome,
                 task_update=updated_task,
                 related_task=task,
@@ -420,6 +697,7 @@ class MemoryExecutor:
                     "command": command,
                     "exit_code": shell_result.exit_code,
                     "task_status": updated_task.metadata.get("status"),
+                    **retry_metadata,
                 },
             )
 
@@ -514,15 +792,7 @@ class MemoryExecutor:
             )
 
         if file_result.status == "error":
-            updated_task = (
-                task
-                if str(task.metadata.get("status", "open")) == "in_progress"
-                else self.memory_store.record_task(
-                    action.title,
-                    status="in_progress",
-                    area=task.subject,
-                )
-            )
+            updated_task, retry_scheduled, retry_metadata = self._record_task_error_state(task)
             tool_outcome = self.memory_store.record_tool_outcome(
                 "file",
                 self._file_outcome_text(action.title, file_result),
@@ -534,11 +804,19 @@ class MemoryExecutor:
                 requested_action=action,
                 executed_kind="run_file_operation",
                 status="error",
-                summary=(
-                    f"File operation for '{action.title}' failed with "
-                    f"{file_result.reason or 'an error'}."
+                summary=self._retry_error_summary(
+                    action.title,
+                    failure_kind="File operation",
+                    failure_reason=file_result.reason,
+                    retry_scheduled=retry_scheduled,
+                    retry_metadata=retry_metadata,
                 ),
-                reasons=["file_error", file_result.reason, *action.reasons],
+                reasons=[
+                    "file_error",
+                    file_result.reason,
+                    *(["retry_scheduled"] if retry_scheduled else []),
+                    *action.reasons,
+                ],
                 tool_outcome=tool_outcome,
                 task_update=updated_task,
                 related_task=task,
@@ -548,6 +826,7 @@ class MemoryExecutor:
                     "file_path": task.metadata.get("file_path"),
                     "symbol_name": task.metadata.get("symbol_name"),
                     "task_status": updated_task.metadata.get("status"),
+                    **retry_metadata,
                 },
             )
 
@@ -591,6 +870,239 @@ class MemoryExecutor:
                 "file_operation": file_operation,
                 "file_path": task.metadata.get("file_path"),
                 "symbol_name": task.metadata.get("symbol_name"),
+                "task_status": updated_task.metadata.get("status") if updated_task else None,
+            },
+        )
+
+    def _execute_task_service_action(
+        self,
+        action: PlannerAction,
+        task: MemoryRecord,
+        service_action: str,
+    ) -> ExecutorResult:
+        try:
+            service_result = self.service_manager.perform_action(service_action)
+        except Exception as exc:
+            updated_task, retry_scheduled, retry_metadata = self._record_task_error_state(task)
+            reason = str(exc).strip() or "service_action_failed"
+            tool_outcome = self.memory_store.record_tool_outcome(
+                "service_manager",
+                (
+                    f"Service action for '{action.title}' failed: {service_action}. "
+                    f"Reason: {reason}"
+                ),
+                status="error",
+                subject=task.subject,
+                tags=["executor", "service_action", "error"],
+                metadata={"service_action": service_action},
+            )
+            return ExecutorResult(
+                requested_action=action,
+                executed_kind="run_service_action",
+                status="error",
+                summary=self._retry_error_summary(
+                    action.title,
+                    failure_kind="Service action",
+                    failure_reason=reason,
+                    retry_scheduled=retry_scheduled,
+                    retry_metadata=retry_metadata,
+                ),
+                reasons=[
+                    "service_action_error",
+                    reason,
+                    *(["retry_scheduled"] if retry_scheduled else []),
+                    *action.reasons,
+                ],
+                tool_outcome=tool_outcome,
+                task_update=updated_task,
+                related_task=task,
+                metadata={
+                    "service_action": service_action,
+                    "task_status": updated_task.metadata.get("status"),
+                    **retry_metadata,
+                },
+            )
+
+        updated_task: MemoryRecord | None
+        next_occurrence: MemoryRecord | None = None
+        if bool(task.metadata.get("complete_on_success", False)):
+            completion = self.memory_store.complete_task(action.title, area=task.subject)
+            updated_task = completion["completed"]
+            next_occurrence = completion["next_occurrence"]
+            summary = (
+                f"Ran service action '{service_action}' for '{action.title}' and completed the task."
+            )
+        else:
+            current_status = str(task.metadata.get("status", "open"))
+            updated_task = (
+                task
+                if current_status == "in_progress"
+                else self.memory_store.record_task(
+                    action.title,
+                    status="in_progress",
+                    area=task.subject,
+                )
+            )
+            summary = (
+                f"Ran service action '{service_action}' for '{action.title}' and kept it in progress."
+            )
+        message = str(service_result.get("message") or "").strip()
+        verification_task = self._ensure_service_verification_task(
+            action=action,
+            task=task,
+            service_action=service_action,
+            service_result=service_result,
+        )
+        tool_outcome = self.memory_store.record_tool_outcome(
+            "service_manager",
+            (
+                f"Ran service action '{service_action}' for '{action.title}'."
+                + (f" {message}" if message else "")
+            ),
+            status="success",
+            subject=task.subject,
+            tags=["executor", "service_action", "success"],
+            metadata={"service_action": service_action},
+        )
+        return ExecutorResult(
+            requested_action=action,
+            executed_kind="run_service_action",
+            status="success",
+            summary=summary,
+            reasons=["service_action_success", *action.reasons],
+            tool_outcome=tool_outcome,
+            task_update=updated_task,
+            related_task=verification_task or next_occurrence,
+            metadata={
+                "service_action": service_action,
+                "service_result": service_result,
+                "verification_task_title": (
+                    verification_task.metadata.get("title") if verification_task else None
+                ),
+                "task_status": updated_task.metadata.get("status") if updated_task else None,
+            },
+        )
+
+    def _execute_task_service_inspection(
+        self,
+        action: PlannerAction,
+        task: MemoryRecord,
+        service_inspection: str,
+    ) -> ExecutorResult:
+        try:
+            inspection_result = self.service_manager.inspect_action(service_inspection)
+        except Exception as exc:
+            updated_task, retry_scheduled, retry_metadata = self._record_task_error_state(task)
+            reason = str(exc).strip() or "service_inspection_failed"
+            tool_outcome = self.memory_store.record_tool_outcome(
+                "service_manager",
+                (
+                    f"Service inspection for '{action.title}' failed: {service_inspection}. "
+                    f"Reason: {reason}"
+                ),
+                status="error",
+                subject=task.subject,
+                tags=["executor", "service_inspection", "error"],
+                metadata={"service_inspection": service_inspection},
+            )
+            return ExecutorResult(
+                requested_action=action,
+                executed_kind="run_service_inspection",
+                status="error",
+                summary=self._retry_error_summary(
+                    action.title,
+                    failure_kind="Service inspection",
+                    failure_reason=reason,
+                    retry_scheduled=retry_scheduled,
+                    retry_metadata=retry_metadata,
+                ),
+                reasons=[
+                    "service_inspection_error",
+                    reason,
+                    *(["retry_scheduled"] if retry_scheduled else []),
+                    *action.reasons,
+                ],
+                tool_outcome=tool_outcome,
+                task_update=updated_task,
+                related_task=task,
+                metadata={
+                    "service_inspection": service_inspection,
+                    "task_status": updated_task.metadata.get("status"),
+                    **retry_metadata,
+                },
+            )
+
+        updated_task: MemoryRecord | None
+        next_occurrence: MemoryRecord | None = None
+        if bool(task.metadata.get("complete_on_success", False)):
+            completion = self.memory_store.complete_task(action.title, area=task.subject)
+            updated_task = completion["completed"]
+            next_occurrence = completion["next_occurrence"]
+            summary = (
+                f"Ran service inspection '{service_inspection}' for '{action.title}' and completed the task."
+            )
+        else:
+            current_status = str(task.metadata.get("status", "open"))
+            updated_task = (
+                task
+                if current_status == "in_progress"
+                else self.memory_store.record_task(
+                    action.title,
+                    status="in_progress",
+                    area=task.subject,
+                )
+            )
+            summary = (
+                f"Ran service inspection '{service_inspection}' for '{action.title}' and kept it in progress."
+            )
+        verification_target = str(inspection_result.get("verification_target") or "").strip()
+        parent_update = self._apply_service_inspection_followup(
+            prep_title=action.title,
+            inspection_result=inspection_result,
+        )
+        resolved_service_sync_tasks = self._resolve_service_sync_followups(
+            area=task.subject,
+            service_inspection=service_inspection,
+            inspection_result=inspection_result,
+        )
+        tool_outcome = self.memory_store.record_tool_outcome(
+            "service_manager",
+            (
+                f"Inspected service state for '{action.title}' via '{service_inspection}'."
+                + (f" Verification target: {verification_target}" if verification_target else "")
+            ),
+            status="success",
+            subject=task.subject,
+            tags=["executor", "service_inspection", "success"],
+            metadata={
+                "service_inspection": service_inspection,
+                "service_inspection_healthy": self._service_inspection_is_healthy(
+                    service_inspection,
+                    inspection_result,
+                ),
+                "resolved_service_sync_titles": [
+                    str(item.metadata.get("title") or item.content)
+                    for item in resolved_service_sync_tasks
+                ],
+            },
+        )
+        return ExecutorResult(
+            requested_action=action,
+            executed_kind="run_service_inspection",
+            status="success",
+            summary=summary,
+            reasons=["service_inspection_success", *action.reasons],
+            tool_outcome=tool_outcome,
+            task_update=updated_task,
+            related_task=parent_update or next_occurrence,
+            metadata={
+                "service_inspection": service_inspection,
+                "inspection_result": inspection_result,
+                "parent_task_updated": parent_update is not None,
+                "resolved_service_sync_titles": [
+                    str(item.metadata.get("title") or item.content)
+                    for item in resolved_service_sync_tasks
+                ],
                 "task_status": updated_task.metadata.get("status") if updated_task else None,
             },
         )
@@ -692,6 +1204,9 @@ class MemoryExecutor:
 
     def _execute_run_maintenance(self, action: PlannerAction) -> ExecutorResult:
         report = self.memory_store.run_maintenance(force=False)
+        service_sync = self.memory_store.sync_service_tasks(self.service_manager.settings())
+        if service_sync["created"] or service_sync["updated"] or service_sync["resolved"]:
+            report.setdefault("executed", {})["service_sync"] = service_sync
         executed = sorted(report.get("executed", {}).keys())
         if executed:
             summary = f"Ran maintenance tasks: {', '.join(executed)}."
@@ -718,6 +1233,228 @@ class MemoryExecutor:
             maintenance_report=report,
             metadata={"executed": executed},
         )
+
+    def _apply_service_inspection_followup(
+        self,
+        *,
+        prep_title: str,
+        inspection_result: dict[str, Any],
+    ) -> MemoryRecord | None:
+        target_title = self._target_title_from_prep_title(prep_title)
+        if not target_title:
+            return None
+        target_task = self.memory_store.find_active_task(target_title, decorate=True)
+        if target_task is None:
+            return None
+        inspection = inspection_result.get("inspection")
+        if not isinstance(inspection, dict):
+            inspection = {}
+        verification_target = str(inspection_result.get("verification_target") or "").strip()
+        status_value = str(inspection.get("status") or "unknown").strip() or "unknown"
+        active_value = inspection.get("active")
+        summary = f"Latest prep inspection: status={status_value}"
+        if isinstance(active_value, bool):
+            summary += f", active={'yes' if active_value else 'no'}"
+        if verification_target:
+            summary += f". Verification target: {verification_target}"
+        current_details = str(target_task.metadata.get("details") or "").strip()
+        summary_prefix = "Latest prep inspection:"
+        detail_lines = [
+            line
+            for line in current_details.splitlines()
+            if not line.strip().startswith(summary_prefix)
+        ]
+        updated_details = "\n".join([*detail_lines, summary]).strip()
+        current_status = str(target_task.metadata.get("status", "open"))
+        blocker_titles = [
+            str(item).strip()
+            for item in target_task.metadata.get("blocked_by", [])
+            if str(item).strip()
+        ]
+        dependency_titles = [
+            str(item).strip()
+            for item in target_task.metadata.get("depends_on", [])
+            if str(item).strip()
+        ]
+        remaining_blockers = [
+            title for title in blocker_titles if not self.memory_store._task_title_is_done(title)
+        ]
+        unresolved_dependencies = [
+            title for title in dependency_titles if not self.memory_store._task_title_is_done(title)
+        ]
+        updated_status = (
+            "open"
+            if current_status == "blocked" and not remaining_blockers and not unresolved_dependencies
+            else current_status
+        )
+        if updated_details == current_details and updated_status == current_status:
+            return target_task
+        return self.memory_store.record_task(
+            target_title,
+            status=updated_status,
+            area=target_task.subject,
+            details=updated_details,
+        )
+
+    def _ensure_service_verification_task(
+        self,
+        *,
+        action: PlannerAction,
+        task: MemoryRecord,
+        service_action: str,
+        service_result: dict[str, Any],
+    ) -> MemoryRecord | None:
+        verification_target = str(service_result.get("verification_target") or "").strip()
+        if not verification_target:
+            return None
+        verification_title = f"Verify {action.title}"
+        action_label = str(task.metadata.get("service_label") or service_action).strip() or service_action
+        verification_scope = self._service_verification_scope(service_action)
+        superseded_tasks = self._suppress_stale_service_verification_tasks(
+            area=task.subject,
+            verification_title=verification_title,
+            verification_scope=verification_scope,
+        )
+        success_message = str(
+            service_result.get("message")
+            or task.metadata.get("service_success_message")
+            or ""
+        ).strip()
+        verification_details = (
+            f"Confirm the post-action state after '{action_label}'. "
+            f"Verification target: {verification_target}."
+        )
+        if success_message:
+            verification_details += f" Expected result: {success_message}"
+        if superseded_tasks:
+            verification_details += (
+                " Superseded older verification task(s): "
+                + ", ".join(str(item.metadata.get("title") or item.content) for item in superseded_tasks)
+                + "."
+            )
+        return self.memory_store.record_task(
+            verification_title,
+            status="open",
+            area=task.subject,
+            owner="agent",
+            details=verification_details,
+            due_date=task.metadata.get("due_date"),
+            service_inspection=service_action,
+            service_label=action_label,
+            complete_on_success=True,
+            tags=["service-verification", "post-action"],
+            importance=min(max(task.importance + 0.01, 0.8), 0.94),
+            confidence=0.9,
+        )
+
+    def _suppress_stale_service_verification_tasks(
+        self,
+        *,
+        area: str,
+        verification_title: str,
+        verification_scope: str,
+    ) -> list[MemoryRecord]:
+        if not verification_scope:
+            return []
+        suppressed: list[MemoryRecord] = []
+        for candidate in self.memory_store._active_task_memories():
+            if candidate.subject != area:
+                continue
+            if str(candidate.metadata.get("status", "open")) == "done":
+                continue
+            candidate_title = str(candidate.metadata.get("title") or candidate.content).strip()
+            if candidate_title == verification_title:
+                continue
+            tags = {str(tag).strip() for tag in candidate.tags if str(tag).strip()}
+            if "service-verification" not in tags:
+                continue
+            candidate_scope = self._service_verification_scope(
+                str(candidate.metadata.get("service_inspection") or "")
+            )
+            if candidate_scope != verification_scope:
+                continue
+            current_details = str(candidate.metadata.get("details") or "").strip()
+            superseded_note = f"Superseded by '{verification_title}'."
+            updated_details = (
+                f"{current_details}\n{superseded_note}".strip()
+                if current_details and superseded_note not in current_details
+                else current_details or superseded_note
+            )
+            suppressed.append(
+                self.memory_store.record_task(
+                    candidate_title,
+                    status="done",
+                    area=area,
+                    details=updated_details,
+                )
+            )
+        return suppressed
+
+    def _service_verification_scope(self, action_name: str) -> str:
+        normalized = str(action_name or "").strip().lower()
+        if normalized in {"install_local_service", "restart_local_service"}:
+            return "local_service"
+        if normalized in {"install_remote_service", "restart_remote_service"}:
+            return "remote_service"
+        if normalized == "install_desktop_launcher":
+            return "desktop_launcher"
+        return normalized
+
+    def _resolve_service_sync_followups(
+        self,
+        *,
+        area: str,
+        service_inspection: str,
+        inspection_result: dict[str, Any],
+    ) -> list[MemoryRecord]:
+        if not self._service_inspection_is_healthy(service_inspection, inspection_result):
+            return []
+        verification_scope = self._service_verification_scope(service_inspection)
+        if not verification_scope:
+            return []
+        resolved: list[MemoryRecord] = []
+        for candidate in self.memory_store._reviewable_task_views():
+            if candidate.subject != area:
+                continue
+            tags = {str(tag).strip() for tag in candidate.tags if str(tag).strip()}
+            if "service-sync" not in tags:
+                continue
+            candidate_action = str(candidate.metadata.get("service_action") or "").strip()
+            if self._service_verification_scope(candidate_action) != verification_scope:
+                continue
+            title = str(candidate.metadata.get("title") or candidate.content)
+            completion = self.memory_store.complete_task(title, area=candidate.subject)
+            completed = completion["completed"]
+            if completed is not None:
+                resolved.append(completed)
+        return resolved
+
+    def _service_inspection_is_healthy(
+        self,
+        service_inspection: str,
+        inspection_result: dict[str, Any],
+    ) -> bool:
+        inspection = inspection_result.get("inspection")
+        if not isinstance(inspection, dict):
+            return False
+        scope = self._service_verification_scope(service_inspection)
+        if scope in {"local_service", "remote_service"}:
+            active = inspection.get("active")
+            status = str(inspection.get("status") or "").strip().lower()
+            return bool(active) or status == "active"
+        if scope == "desktop_launcher":
+            return bool(
+                inspection.get("desktop_entry_installed")
+                or inspection.get("launcher_installed")
+            )
+        return False
+
+    def _target_title_from_prep_title(self, prep_title: str) -> str:
+        prefix = "Prepare safer execution for "
+        clean_title = str(prep_title or "").strip()
+        if not clean_title.startswith(prefix):
+            return ""
+        return clean_title[len(prefix):].strip()
 
     def _execute_ask_user(self, action: PlannerAction) -> ExecutorResult:
         tool_outcome = self.memory_store.record_tool_outcome(
@@ -757,6 +1494,40 @@ class MemoryExecutor:
             decorate=True,
         )
 
+    def _resolve_batch_tasks(self, action: PlannerAction) -> list[MemoryRecord]:
+        resolved: list[MemoryRecord] = []
+        seen_ids: set[int] = set()
+        for task_id in action.metadata.get("task_ids", []):
+            try:
+                candidate = self.memory_store.get_memory(int(task_id))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if candidate.archived_at is not None:
+                continue
+            decorated = self.memory_store.find_active_task(
+                str(candidate.metadata.get("title") or candidate.content),
+                area=candidate.subject,
+                decorate=True,
+            ) or candidate
+            if decorated.id in seen_ids:
+                continue
+            seen_ids.add(decorated.id)
+            resolved.append(decorated)
+
+        if resolved:
+            return resolved
+
+        for title in action.metadata.get("task_titles", []):
+            candidate = self.memory_store.find_active_task(
+                str(title).strip(),
+                decorate=True,
+            )
+            if candidate is None or candidate.id in seen_ids:
+                continue
+            seen_ids.add(candidate.id)
+            resolved.append(candidate)
+        return resolved
+
     def _shell_outcome_text(self, task_title: str, shell_result: ShellExecutionResult) -> str:
         snippet = shell_result.stdout or shell_result.stderr
         if snippet:
@@ -781,3 +1552,98 @@ class MemoryExecutor:
             f"Ran file operation for '{task_title}' "
             f"({file_result.operation} {file_result.path})"
         )
+
+    def _record_task_error_state(
+        self,
+        task: MemoryRecord,
+    ) -> tuple[MemoryRecord, bool, dict[str, Any]]:
+        retry_limit = int(task.metadata.get("retry_limit", 0) or 0)
+        retry_count = int(task.metadata.get("retry_count", 0) or 0)
+        retry_cooldown_minutes = int(task.metadata.get("retry_cooldown_minutes", 0) or 0)
+        next_retry_count = retry_count + 1
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        task_title = str(task.metadata.get("title") or task.content)
+        common_kwargs = {
+            "owner": str(task.metadata.get("owner") or "agent"),
+            "details": task.metadata.get("details"),
+            "depends_on": list(task.metadata.get("depends_on", [])),
+            "blocked_by": list(task.metadata.get("blocked_by", [])),
+            "due_date": task.metadata.get("due_date"),
+            "recurrence_days": task.metadata.get("recurrence_days"),
+            "command": task.metadata.get("command"),
+            "cwd": task.metadata.get("cwd"),
+            "file_operation": task.metadata.get("file_operation"),
+            "file_path": task.metadata.get("file_path"),
+            "file_text": task.metadata.get("file_text"),
+            "find_text": task.metadata.get("find_text"),
+            "symbol_name": task.metadata.get("symbol_name"),
+            "replace_all": bool(task.metadata.get("replace_all", False)),
+            "complete_on_success": bool(task.metadata.get("complete_on_success", False)),
+            "retry_limit": retry_limit,
+            "retry_count": next_retry_count if retry_limit > 0 else retry_count,
+            "retry_cooldown_minutes": retry_cooldown_minutes,
+            "last_retry_at": (
+                now_iso if retry_limit > 0 and next_retry_count <= retry_limit else task.metadata.get("last_retry_at")
+            ),
+            "last_failure_at": now_iso if retry_limit > 0 else task.metadata.get("last_failure_at"),
+            "tags": [tag for tag in task.tags if tag not in {"open", "in_progress", "blocked"}],
+            "importance": task.importance,
+            "confidence": task.confidence,
+        }
+        if retry_limit > 0 and next_retry_count <= retry_limit:
+            snoozed_until = None
+            if retry_cooldown_minutes > 0:
+                snoozed_until = (now + timedelta(minutes=retry_cooldown_minutes)).isoformat()
+            updated_task = self.memory_store.record_task(
+                task_title,
+                status="open",
+                area=task.subject,
+                snoozed_until=snoozed_until,
+                **common_kwargs,
+            )
+            return updated_task, True, {
+                "retry_limit": retry_limit,
+                "retry_count": next_retry_count,
+                "retry_cooldown_minutes": retry_cooldown_minutes,
+                "snoozed_until": snoozed_until,
+            }
+        updated_task = (
+            task
+            if str(task.metadata.get("status", "open")) == "in_progress" and retry_limit <= 0
+            else self.memory_store.record_task(
+                task_title,
+                status="in_progress",
+                area=task.subject,
+                snoozed_until=None,
+                **common_kwargs,
+            )
+        )
+        return updated_task, False, {
+            "retry_limit": retry_limit,
+            "retry_count": next_retry_count if retry_limit > 0 else retry_count,
+            "retry_cooldown_minutes": retry_cooldown_minutes,
+        }
+
+    def _retry_error_summary(
+        self,
+        task_title: str,
+        *,
+        failure_kind: str,
+        failure_reason: str | None,
+        retry_scheduled: bool,
+        retry_metadata: dict[str, Any],
+    ) -> str:
+        detail = failure_reason or "an error"
+        if not retry_scheduled:
+            return f"{failure_kind} for '{task_title}' failed with {detail}."
+        retry_count = int(retry_metadata.get("retry_count", 0) or 0)
+        retry_limit = int(retry_metadata.get("retry_limit", 0) or 0)
+        snoozed_until = str(retry_metadata.get("snoozed_until") or "").strip()
+        summary = (
+            f"{failure_kind} for '{task_title}' failed with {detail}, and retry "
+            f"{retry_count}/{retry_limit} was scheduled."
+        )
+        if snoozed_until:
+            summary += f" Next retry after {snoozed_until}."
+        return summary

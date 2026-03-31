@@ -472,6 +472,12 @@ class MemoryStore:
         snoozed_until: str | None = None,
         command: str | None = None,
         cwd: str | None = None,
+        service_action: str | None = None,
+        service_inspection: str | None = None,
+        service_label: str | None = None,
+        service_requires_confirmation: bool | None = None,
+        service_confirmation_message: str | None = None,
+        service_success_message: str | None = None,
         file_operation: str | None = None,
         file_path: str | None = None,
         file_text: str | None = None,
@@ -479,6 +485,11 @@ class MemoryStore:
         symbol_name: str | None = None,
         replace_all: bool | None = None,
         complete_on_success: bool | None = None,
+        retry_limit: int | None = None,
+        retry_count: int | None = None,
+        retry_cooldown_minutes: int | None = None,
+        last_retry_at: str | None = None,
+        last_failure_at: str | None = None,
         tags: list[str] | None = None,
         importance: float = 0.84,
         confidence: float = 0.88,
@@ -501,6 +512,32 @@ class MemoryStore:
         )
         resolved_command = command if command is not None else prior_metadata.get("command")
         resolved_cwd = cwd if cwd is not None else prior_metadata.get("cwd")
+        resolved_service_action = (
+            service_action if service_action is not None else prior_metadata.get("service_action")
+        )
+        resolved_service_inspection = (
+            service_inspection
+            if service_inspection is not None
+            else prior_metadata.get("service_inspection")
+        )
+        resolved_service_label = (
+            service_label if service_label is not None else prior_metadata.get("service_label")
+        )
+        resolved_service_requires_confirmation = (
+            service_requires_confirmation
+            if service_requires_confirmation is not None
+            else bool(prior_metadata.get("service_requires_confirmation", False))
+        )
+        resolved_service_confirmation_message = (
+            service_confirmation_message
+            if service_confirmation_message is not None
+            else prior_metadata.get("service_confirmation_message")
+        )
+        resolved_service_success_message = (
+            service_success_message
+            if service_success_message is not None
+            else prior_metadata.get("service_success_message")
+        )
         resolved_file_operation = (
             file_operation if file_operation is not None else prior_metadata.get("file_operation")
         )
@@ -520,6 +557,29 @@ class MemoryStore:
             if complete_on_success is not None
             else bool(prior_metadata.get("complete_on_success", False))
         )
+        resolved_retry_limit = (
+            retry_limit
+            if retry_limit is not None
+            else self._optional_int(prior_metadata.get("retry_limit"))
+        )
+        resolved_retry_count = (
+            retry_count
+            if retry_count is not None
+            else self._optional_int(prior_metadata.get("retry_count"))
+        )
+        resolved_retry_cooldown_minutes = (
+            retry_cooldown_minutes
+            if retry_cooldown_minutes is not None
+            else self._optional_int(prior_metadata.get("retry_cooldown_minutes"))
+        )
+        resolved_last_retry_at = (
+            last_retry_at if last_retry_at is not None else prior_metadata.get("last_retry_at")
+        )
+        resolved_last_failure_at = (
+            last_failure_at
+            if last_failure_at is not None
+            else prior_metadata.get("last_failure_at")
+        )
         resolved_cycle_key = str(prior_metadata.get("cycle_key") or uuid.uuid4().hex)
         dependency_titles = self._normalize_task_titles(
             depends_on if depends_on is not None else list(prior_metadata.get("depends_on", []))
@@ -538,8 +598,29 @@ class MemoryStore:
             content += f" Recurs every {resolved_recurrence_days} days."
         if resolved_snoozed_until:
             content += f" Snoozed until: {str(resolved_snoozed_until).strip()}."
+        if resolved_retry_limit:
+            content += (
+                f" Retry policy: {max(int(resolved_retry_count or 0), 0)}/"
+                f"{max(int(resolved_retry_limit), 0)} attempts used."
+            )
+            if resolved_retry_cooldown_minutes:
+                content += (
+                    f" Cooldown: {max(int(resolved_retry_cooldown_minutes), 0)} minutes."
+                )
+            if resolved_last_failure_at:
+                content += f" Last failure: {str(resolved_last_failure_at).strip()}."
+            if resolved_last_retry_at:
+                content += f" Last retry: {str(resolved_last_retry_at).strip()}."
         if resolved_command:
             content += f" Command: {str(resolved_command).strip()}."
+        if resolved_service_action:
+            content += f" Service action: {str(resolved_service_action).strip()}."
+        if resolved_service_inspection:
+            content += f" Service inspection: {str(resolved_service_inspection).strip()}."
+        if resolved_service_label:
+            content += f" Service label: {str(resolved_service_label).strip()}."
+        if resolved_service_requires_confirmation:
+            content += " Service confirmation: required."
         if resolved_file_operation and resolved_file_path:
             content += (
                 f" File operation: {str(resolved_file_operation).strip()} "
@@ -570,6 +651,30 @@ class MemoryStore:
                 ),
                 "command": str(resolved_command).strip() if resolved_command else None,
                 "cwd": str(resolved_cwd).strip() if resolved_cwd else None,
+                "service_action": (
+                    str(resolved_service_action).strip() if resolved_service_action else None
+                ),
+                "service_inspection": (
+                    str(resolved_service_inspection).strip()
+                    if resolved_service_inspection
+                    else None
+                ),
+                "service_label": (
+                    str(resolved_service_label).strip() if resolved_service_label else None
+                ),
+                "service_requires_confirmation": bool(
+                    resolved_service_requires_confirmation
+                ),
+                "service_confirmation_message": (
+                    str(resolved_service_confirmation_message).strip()
+                    if resolved_service_confirmation_message
+                    else None
+                ),
+                "service_success_message": (
+                    str(resolved_service_success_message).strip()
+                    if resolved_service_success_message
+                    else None
+                ),
                 "file_operation": (
                     str(resolved_file_operation).strip() if resolved_file_operation else None
                 ),
@@ -581,6 +686,15 @@ class MemoryStore:
                 ),
                 "replace_all": bool(resolved_replace_all),
                 "complete_on_success": bool(resolved_complete_on_success),
+                "retry_limit": resolved_retry_limit,
+                "retry_count": resolved_retry_count or 0,
+                "retry_cooldown_minutes": resolved_retry_cooldown_minutes,
+                "last_retry_at": (
+                    str(resolved_last_retry_at).strip() if resolved_last_retry_at else None
+                ),
+                "last_failure_at": (
+                    str(resolved_last_failure_at).strip() if resolved_last_failure_at else None
+                ),
                 "cycle_key": resolved_cycle_key,
             },
         )
@@ -625,6 +739,14 @@ class MemoryStore:
             snoozed_until=None,
             command=current.metadata.get("command"),
             cwd=current.metadata.get("cwd"),
+            service_action=current.metadata.get("service_action"),
+            service_inspection=current.metadata.get("service_inspection"),
+            service_label=current.metadata.get("service_label"),
+            service_requires_confirmation=bool(
+                current.metadata.get("service_requires_confirmation", False)
+            ),
+            service_confirmation_message=current.metadata.get("service_confirmation_message"),
+            service_success_message=current.metadata.get("service_success_message"),
             file_operation=current.metadata.get("file_operation"),
             file_path=current.metadata.get("file_path"),
             file_text=current.metadata.get("file_text"),
@@ -632,6 +754,11 @@ class MemoryStore:
             symbol_name=current.metadata.get("symbol_name"),
             replace_all=bool(current.metadata.get("replace_all", False)),
             complete_on_success=bool(current.metadata.get("complete_on_success", False)),
+            retry_limit=self._optional_int(current.metadata.get("retry_limit")),
+            retry_count=self._optional_int(current.metadata.get("retry_count")),
+            retry_cooldown_minutes=self._optional_int(current.metadata.get("retry_cooldown_minutes")),
+            last_retry_at=current.metadata.get("last_retry_at"),
+            last_failure_at=current.metadata.get("last_failure_at"),
             tags=[tag for tag in current.tags if tag not in {"open", "in_progress", "blocked"}],
             importance=current.importance,
             confidence=current.confidence,
@@ -656,6 +783,14 @@ class MemoryStore:
                 snoozed_until=None,
                 command=completed.metadata.get("command"),
                 cwd=completed.metadata.get("cwd"),
+                service_action=completed.metadata.get("service_action"),
+                service_inspection=completed.metadata.get("service_inspection"),
+                service_label=completed.metadata.get("service_label"),
+                service_requires_confirmation=bool(
+                    completed.metadata.get("service_requires_confirmation", False)
+                ),
+                service_confirmation_message=completed.metadata.get("service_confirmation_message"),
+                service_success_message=completed.metadata.get("service_success_message"),
                 file_operation=completed.metadata.get("file_operation"),
                 file_path=completed.metadata.get("file_path"),
                 file_text=completed.metadata.get("file_text"),
@@ -663,6 +798,11 @@ class MemoryStore:
                 symbol_name=completed.metadata.get("symbol_name"),
                 replace_all=bool(completed.metadata.get("replace_all", False)),
                 complete_on_success=bool(completed.metadata.get("complete_on_success", False)),
+                retry_limit=self._optional_int(completed.metadata.get("retry_limit")),
+                retry_count=0,
+                retry_cooldown_minutes=self._optional_int(completed.metadata.get("retry_cooldown_minutes")),
+                last_retry_at=None,
+                last_failure_at=None,
                 tags=[tag for tag in completed.tags if tag not in {"done"}],
                 importance=completed.importance,
                 confidence=completed.confidence,
@@ -698,6 +838,14 @@ class MemoryStore:
             snoozed_until=until,
             command=current.metadata.get("command"),
             cwd=current.metadata.get("cwd"),
+            service_action=current.metadata.get("service_action"),
+            service_inspection=current.metadata.get("service_inspection"),
+            service_label=current.metadata.get("service_label"),
+            service_requires_confirmation=bool(
+                current.metadata.get("service_requires_confirmation", False)
+            ),
+            service_confirmation_message=current.metadata.get("service_confirmation_message"),
+            service_success_message=current.metadata.get("service_success_message"),
             file_operation=current.metadata.get("file_operation"),
             file_path=current.metadata.get("file_path"),
             file_text=current.metadata.get("file_text"),
@@ -705,6 +853,11 @@ class MemoryStore:
             symbol_name=current.metadata.get("symbol_name"),
             replace_all=bool(current.metadata.get("replace_all", False)),
             complete_on_success=bool(current.metadata.get("complete_on_success", False)),
+            retry_limit=self._optional_int(current.metadata.get("retry_limit")),
+            retry_count=self._optional_int(current.metadata.get("retry_count")),
+            retry_cooldown_minutes=self._optional_int(current.metadata.get("retry_cooldown_minutes")),
+            last_retry_at=current.metadata.get("last_retry_at"),
+            last_failure_at=current.metadata.get("last_failure_at"),
             tags=list(current.tags),
             importance=current.importance,
             confidence=current.confidence,
@@ -732,6 +885,14 @@ class MemoryStore:
             snoozed_until=current.metadata.get("snoozed_until"),
             command=current.metadata.get("command"),
             cwd=current.metadata.get("cwd"),
+            service_action=current.metadata.get("service_action"),
+            service_inspection=current.metadata.get("service_inspection"),
+            service_label=current.metadata.get("service_label"),
+            service_requires_confirmation=bool(
+                current.metadata.get("service_requires_confirmation", False)
+            ),
+            service_confirmation_message=current.metadata.get("service_confirmation_message"),
+            service_success_message=current.metadata.get("service_success_message"),
             file_operation=current.metadata.get("file_operation"),
             file_path=current.metadata.get("file_path"),
             file_text=current.metadata.get("file_text"),
@@ -739,6 +900,11 @@ class MemoryStore:
             symbol_name=current.metadata.get("symbol_name"),
             replace_all=bool(current.metadata.get("replace_all", False)),
             complete_on_success=bool(current.metadata.get("complete_on_success", False)),
+            retry_limit=self._optional_int(current.metadata.get("retry_limit")),
+            retry_count=self._optional_int(current.metadata.get("retry_count")),
+            retry_cooldown_minutes=self._optional_int(current.metadata.get("retry_cooldown_minutes")),
+            last_retry_at=current.metadata.get("last_retry_at"),
+            last_failure_at=current.metadata.get("last_failure_at"),
             tags=[tag for tag in current.tags if tag != "blocked"],
             importance=current.importance,
             confidence=current.confidence,
@@ -766,6 +932,14 @@ class MemoryStore:
             snoozed_until="",
             command=current.metadata.get("command"),
             cwd=current.metadata.get("cwd"),
+            service_action=current.metadata.get("service_action"),
+            service_inspection=current.metadata.get("service_inspection"),
+            service_label=current.metadata.get("service_label"),
+            service_requires_confirmation=bool(
+                current.metadata.get("service_requires_confirmation", False)
+            ),
+            service_confirmation_message=current.metadata.get("service_confirmation_message"),
+            service_success_message=current.metadata.get("service_success_message"),
             file_operation=current.metadata.get("file_operation"),
             file_path=current.metadata.get("file_path"),
             file_text=current.metadata.get("file_text"),
@@ -773,6 +947,11 @@ class MemoryStore:
             symbol_name=current.metadata.get("symbol_name"),
             replace_all=bool(current.metadata.get("replace_all", False)),
             complete_on_success=bool(current.metadata.get("complete_on_success", False)),
+            retry_limit=self._optional_int(current.metadata.get("retry_limit")),
+            retry_count=self._optional_int(current.metadata.get("retry_count")),
+            retry_cooldown_minutes=self._optional_int(current.metadata.get("retry_cooldown_minutes")),
+            last_retry_at=current.metadata.get("last_retry_at"),
+            last_failure_at=current.metadata.get("last_failure_at"),
             tags=list(current.tags),
             importance=current.importance,
             confidence=current.confidence,
@@ -1145,6 +1324,135 @@ class MemoryStore:
             "before": status_before,
             "executed": executed,
             "after": self.maintenance_status(),
+        }
+
+    def service_sync_status(
+        self,
+        settings: dict[str, Any],
+        *,
+        area: str = "execution",
+    ) -> dict[str, Any]:
+        onboarding = settings.get("onboarding") if isinstance(settings, dict) else {}
+        action_items = onboarding.get("actions") if isinstance(onboarding, dict) else []
+        if not isinstance(action_items, list):
+            action_items = []
+
+        recommended_actions: list[str] = []
+        missing_titles: list[str] = []
+        stale_titles: list[str] = []
+
+        for raw_item in action_items:
+            if not isinstance(raw_item, dict):
+                continue
+            action_name = str(raw_item.get("action") or "").strip()
+            if not action_name or not bool(raw_item.get("enabled", True)):
+                continue
+            recommended_actions.append(action_name)
+            title = self._service_sync_task_title(raw_item)
+            existing = self.find_active_task(title, area=area, decorate=True)
+            if existing is None:
+                missing_titles.append(title)
+                continue
+            existing_action = str(existing.metadata.get("service_action") or "").strip()
+            if existing_action != action_name:
+                stale_titles.append(title)
+
+        return {
+            "due": bool(missing_titles or stale_titles),
+            "recommended_actions": sorted(dict.fromkeys(recommended_actions)),
+            "missing_titles": missing_titles,
+            "stale_titles": stale_titles,
+            "recommended_count": len(set(recommended_actions)),
+        }
+
+    def sync_service_tasks(
+        self,
+        settings: dict[str, Any],
+        *,
+        area: str = "execution",
+    ) -> dict[str, Any]:
+        onboarding = settings.get("onboarding") if isinstance(settings, dict) else {}
+        action_items = onboarding.get("actions") if isinstance(onboarding, dict) else []
+        if not isinstance(action_items, list):
+            action_items = []
+
+        created: list[dict[str, Any]] = []
+        updated: list[dict[str, Any]] = []
+        unchanged: list[dict[str, Any]] = []
+        resolved: list[dict[str, Any]] = []
+        recommended_actions: set[str] = set()
+
+        for raw_item in action_items:
+            if not isinstance(raw_item, dict):
+                continue
+            action_name = str(raw_item.get("action") or "").strip()
+            if not action_name or not bool(raw_item.get("enabled", True)):
+                continue
+            recommended_actions.add(action_name)
+            title = self._service_sync_task_title(raw_item)
+            details = self._service_sync_task_details(raw_item)
+            existing = self.find_active_task(title, area=area, decorate=True)
+            status = (
+                str(existing.metadata.get("status", "open"))
+                if existing is not None
+                else "open"
+            )
+            task = self.record_task(
+                title,
+                status=status if status in {"open", "in_progress", "blocked"} else "open",
+                area=area,
+                owner="agent",
+                details=details,
+                service_action=action_name,
+                service_label=raw_item.get("label"),
+                service_requires_confirmation=bool(
+                    raw_item.get("requires_confirmation", False)
+                ),
+                service_confirmation_message=raw_item.get("confirmation_message"),
+                service_success_message=raw_item.get("success_message"),
+                complete_on_success=True,
+                tags=["cockpit", "service-action", "service-sync"],
+                importance=self._service_sync_importance(action_name),
+                confidence=0.92,
+            )
+            task_summary = {
+                "task_id": task.id,
+                "title": title,
+                "service_action": action_name,
+            }
+            if existing is None:
+                created.append(task_summary)
+            elif existing.id == task.id:
+                unchanged.append(task_summary)
+            else:
+                updated.append(task_summary)
+
+        for task in self._reviewable_task_views():
+            action_name = str(task.metadata.get("service_action") or "").strip()
+            if not action_name:
+                continue
+            if "service-sync" not in set(task.tags):
+                continue
+            if action_name in recommended_actions:
+                continue
+            title = str(task.metadata.get("title") or task.content)
+            completion = self.complete_task(title, area=task.subject)
+            completed = completion["completed"]
+            resolved.append(
+                {
+                    "task_id": completed.id if completed is not None else task.id,
+                    "title": title,
+                    "service_action": action_name,
+                }
+            )
+
+        return {
+            "recommended_actions": sorted(recommended_actions),
+            "created": created,
+            "updated": updated,
+            "unchanged": unchanged,
+            "resolved": resolved,
+            "count": len(created) + len(updated) + len(unchanged),
         }
 
     def run_maintenance_if_due(self) -> dict[str, Any] | None:
@@ -2158,6 +2466,36 @@ class MemoryStore:
             for task in self._active_task_memories()
             if str(task.metadata.get("status", "open")) in {"blocked", "in_progress", "open"}
         ]
+
+    def _service_sync_task_title(self, action_item: dict[str, Any]) -> str:
+        label = str(
+            action_item.get("label") or action_item.get("action") or "Service action"
+        ).strip()
+        return f"Cockpit setup: {label}"
+
+    def _service_sync_task_details(self, action_item: dict[str, Any]) -> str:
+        description = str(action_item.get("description") or "").strip()
+        confirmation = str(action_item.get("confirmation_message") or "").strip()
+        success = str(action_item.get("success_message") or "").strip()
+        parts = [part for part in [description, confirmation, success] if part]
+        if not parts:
+            action_name = str(action_item.get("action") or "service action").strip()
+            return f"Sync and complete the recommended cockpit service action '{action_name}'."
+        return " ".join(parts)
+
+    def _service_sync_importance(self, action_name: str) -> float:
+        normalized = str(action_name or "").strip()
+        if normalized == "install_remote_service":
+            return 0.94
+        if normalized == "install_local_service":
+            return 0.92
+        if normalized == "restart_remote_service":
+            return 0.9
+        if normalized == "restart_local_service":
+            return 0.86
+        if normalized == "install_desktop_launcher":
+            return 0.82
+        return 0.84
 
     def _count_reviewable_tasks(self) -> int:
         return len(self._reviewable_task_views())

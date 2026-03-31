@@ -18,6 +18,7 @@ from .memory import MemoryStore
 from .patch_runner import WorkspacePatchRunner
 from .planner import MemoryPlanner, PlannerSnapshot
 from .service_manager import CockpitServiceManager
+from .soul import SoulProposal, apply_soul_proposal, load_soul_document, review_soul_document
 
 
 COCKPIT_HTML = """<!doctype html>
@@ -383,6 +384,16 @@ COCKPIT_HTML = """<!doctype html>
       </div>
 
       <div class="panel full">
+        <h3>How Ernie Operates</h3>
+        <div id="soul-panel" class="cards"></div>
+      </div>
+
+      <div class="panel full">
+        <h3>First Run Tutorial</h3>
+        <div id="tutorial-panel" class="cards"></div>
+      </div>
+
+      <div class="panel full">
         <h3>Machine status</h3>
         <div id="onboarding-panel" class="cards"></div>
       </div>
@@ -454,6 +465,34 @@ COCKPIT_HTML = """<!doctype html>
       </div>
 
       <div class="panel half">
+        <h3>Prompt Workshop</h3>
+        <div class="controls">
+          <div>
+            <label for="prompt-draft">Draft prompt</label>
+            <textarea id="prompt-draft" placeholder="Write a draft prompt here. This workshop text stays quarantined until you explicitly promote it."></textarea>
+          </div>
+          <div class="actions">
+            <button class="ghost" id="prompt-improve">Improve</button>
+            <button class="ghost" id="prompt-clarify">Clarify</button>
+            <button class="ghost" id="prompt-shorten">Shorten</button>
+            <button class="ghost" id="prompt-safety-check">Safety check</button>
+            <button class="secondary" id="prompt-undo-history">Undo local edit</button>
+            <button class="secondary" id="prompt-replace-selection">Replace selection</button>
+            <button class="secondary" id="prompt-append-result">Append result</button>
+            <button class="secondary" id="prompt-adopt-result">Use result as draft</button>
+            <button id="prompt-pilot-result">Send result to guided loop</button>
+            <button id="prompt-pilot">Send draft to guided loop</button>
+            <button id="prompt-promote-result">Promote result to live note</button>
+            <button id="prompt-promote">Promote draft to live note</button>
+          </div>
+        </div>
+        <div id="prompt-workshop-summary" class="cards"></div>
+        <div id="prompt-workshop-compare" class="cards"></div>
+        <div id="prompt-workshop-history" class="cards"></div>
+        <pre id="prompt-workshop-output" class="muted">No draft workshop run yet.</pre>
+      </div>
+
+      <div class="panel half">
         <h3>Recent nudges</h3>
         <div id="recent-nudges" class="cards"></div>
       </div>
@@ -470,6 +509,7 @@ COCKPIT_HTML = """<!doctype html>
 
       <div class="panel full">
         <h3>Pilot approval queue</h3>
+        <div class="muted tiny" style="margin-bottom:12px;">Manual pilot requests and Prompt Workshop results both land here after preview. Request origin stays visible in the queue and detail view.</div>
         <div class="controls">
           <div>
             <label for="pilot-text">Pilot request</label>
@@ -538,6 +578,10 @@ COCKPIT_HTML = """<!doctype html>
     let currentPilotItems = [];
     let currentPatchRuns = [];
     let currentActivityItems = [];
+    let currentSoulReview = null;
+    let currentPlanExplanation = null;
+    let currentPromptWorkshop = null;
+    let currentPromptHistory = [];
     let selectedPilotPendingId = "";
     let selectedPatchRunId = 0;
     let selectedActivityId = 0;
@@ -642,6 +686,22 @@ COCKPIT_HTML = """<!doctype html>
       return `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`;
     }
 
+    function escapeHtml(value) {
+      return String(value || "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }
+
+    function card(title, body) {
+      return `
+        <div class="card">
+          <div class="headline">${title}</div>
+          <div class="body">${body}</div>
+        </div>
+      `;
+    }
+
     function pillClassForState(state) {
       const normalized = String(state || "").toLowerCase();
       if (["error", "failed", "rejected", "blocked", "overdue"].includes(normalized)) return "danger";
@@ -674,10 +734,15 @@ COCKPIT_HTML = """<!doctype html>
     function summarizePilotCard(item) {
       const action = item.selected_action || {};
       const approval = item.approval || {};
+      const source = item.request_origin === "prompt_workshop"
+        ? `Prompt Workshop ${item.prompt_source === "result" ? "result" : "draft"}`
+        : "";
       if (approval.category === "trusted_file_operation") {
-        return summarizeTrustedApproval(approval) || approval.reason || action.summary || "Trusted pilot action.";
+        const base = summarizeTrustedApproval(approval) || approval.reason || action.summary || "Trusted pilot action.";
+        return source ? `${source}. ${base}` : base;
       }
-      return approval.prompt || approval.reason || action.summary || "Review this proposed pilot action before it runs.";
+      const base = approval.prompt || approval.reason || action.summary || "Review this proposed pilot action before it runs.";
+      return source ? `${source}. ${base}` : base;
     }
 
     function summarizeTrustedApproval(approval) {
@@ -694,6 +759,169 @@ COCKPIT_HTML = """<!doctype html>
         pieces.push(`Matched ${matched} successful supervised previews with a threshold of ${required}.`);
       }
       return pieces.join(" ");
+    }
+
+    function workshopModeLabel(mode) {
+      const normalized = String(mode || "").trim().toLowerCase();
+      if (normalized === "clarify") return "Clarify";
+      if (normalized === "shorten") return "Shorten";
+      if (normalized === "safety_check") return "Safety check";
+      return "Improve";
+    }
+
+    function rememberPromptHistory(label) {
+      const node = promptDraftNode();
+      currentPromptHistory.unshift({
+        label: label || "Draft state",
+        draft: node ? node.value : "",
+        workshop: currentPromptWorkshop
+          ? {
+              mode: currentPromptWorkshop.mode,
+              draft: currentPromptWorkshop.draft,
+              text: currentPromptWorkshop.text
+            }
+          : null
+      });
+      currentPromptHistory = currentPromptHistory.slice(0, 6);
+    }
+
+    function renderPromptHistory() {
+      const node = document.getElementById("prompt-workshop-history");
+      if (!currentPromptHistory.length) {
+        node.innerHTML = card("Local prompt history", "No local draft history yet. Workshop runs and draft edits will build a short undo buffer in this browser only.");
+        return;
+      }
+      const items = currentPromptHistory
+        .map((entry, index) => {
+          const draftPreview = escapeHtml(String(entry.draft || "").slice(0, 140) || "Empty draft.");
+          return `
+            <div class="card">
+              <div class="eyebrow">History ${index + 1}</div>
+              <div class="headline">${escapeHtml(entry.label || "Draft state")}</div>
+              <div class="body">
+                <div class="muted">${draftPreview}${String(entry.draft || "").length > 140 ? "..." : ""}</div>
+                <div style="margin-top:10px;"><button class="ghost prompt-history-restore" data-history-index="${index}">Restore this draft</button></div>
+              </div>
+            </div>
+          `;
+        })
+        .join("");
+      node.innerHTML = card("Local prompt history", "This undo buffer lives only in the browser and does not enter live memory.") + items;
+      for (const button of node.querySelectorAll(".prompt-history-restore")) {
+        button.addEventListener("click", () => restorePromptHistory(Number(button.dataset.historyIndex || "0")));
+      }
+    }
+
+    function renderPromptWorkshop() {
+      const summaryNode = document.getElementById("prompt-workshop-summary");
+      const compareNode = document.getElementById("prompt-workshop-compare");
+      if (!currentPromptWorkshop) {
+        summaryNode.innerHTML = card("Workshop mode", "No workshop run yet. Run one of the draft helpers to compare your current prompt against a quarantined result.");
+        compareNode.innerHTML = "";
+        renderPromptHistory();
+        return;
+      }
+      const modeLabel = workshopModeLabel(currentPromptWorkshop.mode);
+      const modelLine = currentPromptWorkshop.used_model
+        ? "Model-assisted draft help."
+        : "Fallback draft help.";
+      summaryNode.innerHTML =
+        card("Workshop mode", `${modeLabel}. ${modelLine} The result is still quarantined until you promote it.`) +
+        card(
+          "Promotion boundary",
+          "Use result as draft keeps the text quarantined. Promote result to live note is the point where it becomes live input."
+        ) +
+        card(
+          "Draft editing helpers",
+          "Replace selection swaps only the highlighted part of your draft. Append result keeps your original draft and adds the workshop result below it."
+        ) +
+        card(
+          "Local history buffer",
+          "Undo local edit restores recent draft states inside this browser only. It does not touch memory, plans, or live input."
+        );
+      const draftText = currentPromptWorkshop.draft || "No draft captured.";
+      const resultText = currentPromptWorkshop.text || "No workshop result returned.";
+      const sameText = draftText.trim() === resultText.trim();
+      compareNode.innerHTML =
+        card("Draft before workshop", `<pre>${escapeHtml(draftText)}</pre>`) +
+        card(
+          sameText ? "Workshop result" : "Workshop result after rewrite",
+          `<pre>${escapeHtml(resultText)}</pre>${sameText ? '<div class="muted">The workshop preserved the original wording.</div>' : '<div class="muted">Review the rewritten result before adopting or promoting it.</div>'}`
+        );
+      renderPromptHistory();
+    }
+
+    function promptDraftNode() {
+      return document.getElementById("prompt-draft");
+    }
+
+    function replacePromptDraftSelection() {
+      if (!currentPromptWorkshop?.text) return;
+      const node = promptDraftNode();
+      const start = Number(node.selectionStart || 0);
+      const end = Number(node.selectionEnd || 0);
+      if (start === end) return;
+      rememberPromptHistory("Before replace selection");
+      node.setRangeText(currentPromptWorkshop.text, start, end, "end");
+      node.focus();
+      setActionBanner("info", "Draft selection replaced.", "Only the highlighted part of the draft was replaced. The result is still quarantined until you promote it.");
+      renderPromptWorkshop();
+    }
+
+    function appendPromptWorkshopResult() {
+      if (!currentPromptWorkshop?.text) return;
+      const node = promptDraftNode();
+      rememberPromptHistory("Before append result");
+      const current = node.value.trimEnd();
+      node.value = current ? `${current}\n\n${currentPromptWorkshop.text}` : currentPromptWorkshop.text;
+      node.focus();
+      setActionBanner("info", "Workshop result appended.", "The result was appended below the current draft and remains quarantined until you promote it.");
+      renderPromptWorkshop();
+    }
+
+    function restorePromptHistory(index) {
+      const entry = currentPromptHistory[index];
+      if (!entry) return;
+      const node = promptDraftNode();
+      node.value = entry.draft || "";
+      currentPromptWorkshop = entry.workshop
+        ? {
+            mode: entry.workshop.mode,
+            draft: entry.workshop.draft,
+            text: entry.workshop.text
+          }
+        : null;
+      currentPromptHistory.splice(index, 1);
+      node.focus();
+      setActionBanner("info", "Local draft restored.", "A recent quarantined draft state was restored from the browser history buffer.");
+      renderPromptWorkshop();
+    }
+
+    function undoPromptHistory() {
+      restorePromptHistory(0);
+    }
+
+    function explainPlannerAction(kind) {
+      const normalized = String(kind || "").trim().toLowerCase();
+      if (normalized === "prepare_task") {
+        return "Prepare splits a risky or confirmation-heavy task into a safer preflight step before the main action runs.";
+      }
+      if (normalized === "delegate_task") {
+        return "Delegate creates a tracked child task so the original work can route through a smaller handoff.";
+      }
+      if (normalized === "work_task") {
+        return "Run starts the task's current bounded execution path, such as a command, service action, inspection, or state transition.";
+      }
+      if (normalized === "resolve_blocker") {
+        return "Resolve blocker tries to clear the active dependency preventing this task from moving.";
+      }
+      if (normalized === "run_maintenance") {
+        return "Maintenance refreshes Ernie's own task and service state, then resurfaces anything still due.";
+      }
+      if (normalized === "batch_ready_tasks") {
+        return "Batch runs several already-safe ready tasks in sequence.";
+      }
+      return "This planner step is a bounded next move surfaced from the current task and system state.";
     }
 
     function summarizePatchCard(run) {
@@ -769,6 +997,7 @@ COCKPIT_HTML = """<!doctype html>
       const localService = settings.local_service || {};
       const remoteService = settings.remote_service || {};
       const desktop = settings.desktop || {};
+      const serviceSyncStatus = settings.service_sync_status || {};
       const pilotPolicy = settings.pilot_policy || {};
       const actions = settings.actions || [];
       const remoteUrl = remoteService.url || (remoteService.display_host && remoteService.port
@@ -784,6 +1013,7 @@ COCKPIT_HTML = """<!doctype html>
           <div class="body">Policy file: ${pilotPolicy.policy_path || pilotPolicy.loaded_from || "workspace default"}</div>
           <div class="body" style="margin-top:8px;">Operations: ${trustedOps.length ? trustedOps.join(", ") : "none"}</div>
           <div class="body" style="margin-top:8px;">Success threshold: ${trustedThreshold}</div>
+          <div class="body muted" style="margin-top:10px;">Trusted writes only cover repeated low-risk single-file edits that already succeeded under supervision. They are a shortcut for familiar safe changes, not open-ended write permission.</div>
           <div class="controls" style="margin-top:12px;">
             <div>
               <label for="trusted-write-enabled">Trusted low-risk writes</label>
@@ -807,6 +1037,19 @@ COCKPIT_HTML = """<!doctype html>
         </div>
       `;
       const trustedSignals = pilotPolicy.trusted_write_recommendations || [];
+      const suppressedSyncActions = serviceSyncStatus.suppressed_recent_verification_actions || [];
+      const suppressedSyncTitles = serviceSyncStatus.suppressed_recent_verification_titles || [];
+      const suppressedSyncScopes = serviceSyncStatus.suppressed_recent_verification_scopes || [];
+      const suppressionCard = suppressedSyncActions.length ? `
+        <div class="card">
+          <div class="eyebrow">Recent healthy verification</div>
+          <div class="headline">Service maintenance temporarily suppressed</div>
+          <div class="body">Ernie just verified a healthy service path in this scope, so the matching setup recommendation is temporarily downgraded instead of resurfacing immediately.</div>
+          <div class="body" style="margin-top:8px;">Scopes: ${suppressedSyncScopes.join(", ")}</div>
+          <div class="body" style="margin-top:8px;">Suppressed actions: ${suppressedSyncActions.join(", ")}</div>
+          <div class="body" style="margin-top:8px;">Suppressed tasks: ${suppressedSyncTitles.length ? suppressedSyncTitles.join(", ") : "No queued setup task titles were left to suppress."}</div>
+        </div>
+      ` : "";
       const trustedSignalCard = `
         <div class="card">
           <div class="eyebrow">Pilot history trust signals</div>
@@ -865,6 +1108,7 @@ COCKPIT_HTML = """<!doctype html>
           <div class="body" style="margin-top:8px;">Icon: ${desktop.icon_installed ? "installed" : "missing"}</div>
         </div>
         ${policyCard}
+        ${suppressionCard}
         ${trustedSignalCard}
         ${actionButtons}
       `;
@@ -924,8 +1168,20 @@ COCKPIT_HTML = """<!doctype html>
     function renderOnboarding(settings) {
       const node = document.getElementById("onboarding-panel");
       const onboarding = settings.onboarding || {};
+      const serviceSyncStatus = settings.service_sync_status || {};
       const steps = onboarding.recommended_steps || [];
       const actions = onboarding.actions || [];
+      const suppressedSyncActions = serviceSyncStatus.suppressed_recent_verification_actions || [];
+      const suppressedSyncTitles = serviceSyncStatus.suppressed_recent_verification_titles || [];
+      const suppressedSyncScopes = serviceSyncStatus.suppressed_recent_verification_scopes || [];
+      const suppressedAgeSeconds = Number(serviceSyncStatus.suppressed_recent_verification_age_seconds || 0);
+      const suppressedExpiresInSeconds = Number(serviceSyncStatus.suppressed_recent_verification_expires_in_seconds || 0);
+      const freshnessText = suppressedSyncActions.length
+        ? `Healthy verification recorded about ${Math.max(0, Math.floor(suppressedAgeSeconds / 60))} minute(s) ago.`
+        : "";
+      const expiryText = suppressedSyncActions.length
+        ? `Suppression window expires in about ${Math.max(0, Math.ceil(suppressedExpiresInSeconds / 60))} minute(s).`
+        : "";
       const chips = [];
       chips.push(`Local service ${onboarding.local_service_ready ? "ready" : "needs attention"}`);
       chips.push(`Desktop ${onboarding.desktop_ready ? "installed" : "not installed"}`);
@@ -941,6 +1197,15 @@ COCKPIT_HTML = """<!doctype html>
         <div class="card">
           <div class="eyebrow">Recommended next step</div>
           <div class="body">${steps.length ? steps.join(" ") : "No setup guidance available."}</div>
+          ${suppressedSyncActions.length ? `
+            <div class="notice info" style="margin-top:12px;">
+              <div class="headline" style="font-size:1rem;">Recent healthy verification is calming one setup recommendation.</div>
+              <div class="body">Suppressed actions: ${suppressedSyncActions.join(", ")}</div>
+              <div class="body" style="margin-top:8px;">Scopes: ${suppressedSyncScopes.join(", ")}</div>
+              <div class="body" style="margin-top:8px;">${freshnessText} ${expiryText}</div>
+              <div class="body" style="margin-top:8px;">Suppressed tasks: ${suppressedSyncTitles.length ? suppressedSyncTitles.join(", ") : "No queued setup task titles were left to suppress."}</div>
+            </div>
+          ` : ""}
           <div style="margin-top:12px; display:grid; gap:10px;">
             ${actions.map((item) => `
               <div class="card" style="padding:12px; border-radius:16px;">
@@ -961,6 +1226,202 @@ COCKPIT_HTML = """<!doctype html>
           await runSetupAction(action);
         });
       });
+    }
+
+    function renderSoul(settings) {
+      const node = document.getElementById("soul-panel");
+      const soul = settings.soul || {};
+      const principles = soul.principles || [];
+      const proposals = currentSoulReview?.proposals || [];
+      const auditTrail = settings.soul_audit || [];
+      node.innerHTML = `
+        <div class="card">
+          <div class="eyebrow">${soul.source || "SOUL.md"}</div>
+          <div class="headline">${soul.title || "Ernie"}</div>
+          <div class="body">${soul.summary || "Ernie should stay calm, bounded, and legible while operating the local machine."}</div>
+          <div class="body" style="margin-top:10px;">${principles.length ? principles.map((item) => `- ${item}`).join("<br>") : "No soul principles are loaded yet."}</div>
+          <div class="actions" style="margin-top:12px;">
+            <button id="review-soul" class="ghost">Review soul</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="eyebrow">Governed identity loop</div>
+          <div class="headline">${proposals.length ? "Review proposed amendments" : "No soul amendments proposed yet"}</div>
+          <div class="body">${proposals.length ? "Ernie can suggest amendments from operator history, but nothing applies until you click an approval button." : "Run a soul review to inspect evidence-backed amendments before making any identity change."}</div>
+          <div style="margin-top:12px; display:grid; gap:10px;">
+            ${proposals.map((proposal) => `
+              <div class="card" style="padding:12px; border-radius:16px;">
+                <div class="headline" style="font-size:1rem;">${proposal.title}</div>
+                <div class="body" style="margin-top:6px;">${proposal.rationale}</div>
+                <div class="body muted" style="margin-top:8px;">Why now: ${proposal.explanation || "No explanation recorded."}</div>
+                <div class="body muted" style="margin-top:6px;">Target section: ${proposal.section || "unknown"} · Signature: ${proposal.evidence_signature || "n/a"}</div>
+                <div class="body muted" style="margin-top:6px;">${proposal.resurfaced_after_dismissal ? "This proposal resurfaced because the evidence changed after an earlier dismissal." : "This proposal has not resurfaced after dismissal."}</div>
+                <div class="body" style="margin-top:8px;">${proposal.amendment}</div>
+                <div class="body muted" style="margin-top:8px;">${(proposal.evidence || []).length ? "Evidence from recent operator messages:" : "No evidence recorded."}</div>
+                <div class="body muted" style="margin-top:6px;">${(proposal.evidence || []).length ? proposal.evidence.map((item) => `- ${item}`).join("<br>") : ""}</div>
+                <div class="actions" style="margin-top:10px;">
+                  <button class="ghost" data-soul-apply="${proposal.proposal_id}">Apply this amendment</button>
+                  <button class="ghost" data-soul-dismiss="${proposal.proposal_id}">Dismiss for now</button>
+                </div>
+              </div>
+            `).join("")}
+          </div>
+        </div>
+        <div class="card">
+          <div class="eyebrow">Soul audit trail</div>
+          <div class="headline">${auditTrail.length ? "Recent identity reviews and changes" : "No soul audit entries yet"}</div>
+          <div class="body">${auditTrail.length ? auditTrail.map((item) => `${item.tool_name} [${item.status}]: ${item.outcome}<br><span class="muted">proposal=${item.proposal_id || "n/a"} · signature=${item.evidence_signature || "n/a"}</span>`).join("<br>") : "Reviewed, applied, and dismissed soul actions will appear here."}</div>
+        </div>
+      `;
+      const reviewSoul = document.getElementById("review-soul");
+      if (reviewSoul) {
+        reviewSoul.addEventListener("click", async () => {
+          const payload = await requestJson("/api/soul/review", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({})
+          });
+          currentSoulReview = payload;
+          setActionBanner("success", "Soul review ready.", payload.proposals?.length ? `Ernie proposed ${payload.proposals.length} amendment(s) for review.` : "No new soul amendments were proposed from recent operator history.");
+          renderSoul(settings);
+          document.getElementById("execution-output").textContent = JSON.stringify(payload, null, 2);
+        });
+      }
+      node.querySelectorAll("[data-soul-apply]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const proposalId = button.getAttribute("data-soul-apply");
+          const payload = await requestJson("/api/soul/apply", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({proposal_id: proposalId})
+          });
+          currentSoulReview = payload.review || null;
+          setActionBanner("success", "Soul amendment applied.", payload.summary || "The approved soul amendment was written to SOUL.md.");
+          document.getElementById("execution-output").textContent = JSON.stringify(payload, null, 2);
+          await loadDashboard();
+        });
+      });
+      node.querySelectorAll("[data-soul-dismiss]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const proposalId = button.getAttribute("data-soul-dismiss");
+          const payload = await requestJson("/api/soul/dismiss", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({proposal_id: proposalId})
+          });
+          currentSoulReview = payload.review || null;
+          setActionBanner("info", "Soul amendment dismissed.", payload.summary || "The proposal was dismissed and will stop resurfacing until the evidence changes.");
+          document.getElementById("execution-output").textContent = JSON.stringify(payload, null, 2);
+          await loadDashboard();
+        });
+      });
+    }
+
+    function renderTutorial(snapshot, settings) {
+      const node = document.getElementById("tutorial-panel");
+      const recommendation = snapshot.plan?.recommendation || null;
+      const pendingApprovals = snapshot.pending_pilot_turns || [];
+      const recentActivity = snapshot.recent_activity || [];
+      const recentDemoEvents = recentActivity.filter((item) => (item.metadata || {}).tool_name === "demo-workflow").slice(0, 3);
+      const onboardingActions = settings.onboarding?.actions || [];
+      const dueSetupActions = onboardingActions.filter((item) => item.enabled);
+      const steps = [];
+
+      steps.push({
+        state: dueSetupActions.length ? "recommended" : "ready",
+        title: dueSetupActions.length ? "Start with machine setup" : "Machine setup looks usable",
+        body: dueSetupActions.length
+          ? `Use Machine status to run ${dueSetupActions[0].label}. Clear setup work before testing deeper agent flows.`
+          : "No urgent setup action is blocking your first bounded test run. You can move straight to the planner loop."
+      });
+      steps.push({
+        state: recommendation ? "ready" : "waiting",
+        title: "Review the planner recommendation",
+        body: recommendation
+          ? `Open Next action and read why Ernie chose "${recommendation.title}". If it looks bounded and sensible, run one step only.`
+          : "No recommendation is surfaced yet. Capture a task or refresh the view first."
+      });
+      steps.push({
+        state: pendingApprovals.length ? "approval" : "ready",
+        title: pendingApprovals.length ? "Stop and review approval requests" : "If approval appears, stop and inspect it",
+        body: pendingApprovals.length
+          ? `Pilot approval queue currently has ${pendingApprovals.length} item(s). Read the prompt before approving anything.`
+          : "If Ernie asks for approval, use the Pilot approval queue and read the rationale before continuing."
+      });
+      steps.push({
+        state: recentActivity.length ? "ready" : "waiting",
+        title: "Check what changed after each step",
+        body: recentActivity.length
+          ? "Use Action status and Operator timeline to confirm what just ran and what Ernie recommends next."
+          : "After you run a step, read Action status and Operator timeline before taking another action."
+      });
+      steps.push({
+        state: "info",
+        title: "Safe stopping rule",
+        body: "For an early test session, stop after one or two bounded actions. If the next move looks unclear, refresh and review instead of pushing deeper."
+      });
+
+      node.innerHTML = `
+        <div class="card">
+          <div class="eyebrow">Guided first session</div>
+          <div class="headline">Use bounded steps for your first hands-on test</div>
+          <div class="body">Refresh state, inspect one recommendation, run one bounded step, confirm the outcome, then pause or review again.</div>
+          <div class="actions" style="margin-top:12px;">
+            <button id="seed-demo-workflow" class="ghost">Seed demo workflow</button>
+            <button id="reset-demo-workflow" class="ghost">Reset demo workflow</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="eyebrow">Recent demo walkthrough</div>
+          <div class="headline">${recentDemoEvents.length ? "Most recent demo events" : "No demo events recorded yet"}</div>
+          <div class="body">${recentDemoEvents.length ? recentDemoEvents.map((item) => summarizeActivity(item)).join(" ") : "Seed the demo workflow, run one bounded demo step, and the walkthrough history will appear here."}</div>
+        </div>
+        ${steps.map((step, index) => `
+          <div class="card">
+            <div class="status-line"><span class="eyebrow">step ${index + 1}</span>${renderStatePill(step.state)}</div>
+            <div class="headline">${step.title}</div>
+            <div class="body">${step.body}</div>
+          </div>
+        `).join("")}
+      `;
+      const seedDemo = document.getElementById("seed-demo-workflow");
+      if (seedDemo) {
+        seedDemo.addEventListener("click", async () => {
+          const payload = await requestJson("/api/demo/seed", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({})
+          });
+          const created = payload.created_titles || [];
+          const unchanged = payload.unchanged_titles || [];
+          const summary = [
+            created.length ? `Created: ${created.join(", ")}.` : "No new demo tasks were needed.",
+            unchanged.length ? `Already present: ${unchanged.join(", ")}.` : "",
+            "Use Next action or task detail to try one bounded step."
+          ].filter(Boolean).join(" ");
+          setActionBanner("success", "Demo workflow ready.", summary);
+          document.getElementById("execution-output").textContent = JSON.stringify(payload, null, 2);
+          await loadDashboard();
+        });
+      }
+      const resetDemo = document.getElementById("reset-demo-workflow");
+      if (resetDemo) {
+        resetDemo.addEventListener("click", async () => {
+          const payload = await requestJson("/api/demo/reset", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({})
+          });
+          const resetTitles = payload.reset_titles || [];
+          const summary = [
+            resetTitles.length ? `Reset: ${resetTitles.join(", ")}.` : "No demo tasks were reset.",
+            "This restores the demo tasks only. It does not undo unrelated edits or service changes.",
+          ].join(" ");
+          setActionBanner("success", "Demo workflow reset.", summary);
+          document.getElementById("execution-output").textContent = JSON.stringify(payload, null, 2);
+          await loadDashboard();
+        });
+      }
     }
 
     async function runSetupAction(action) {
@@ -989,6 +1450,25 @@ COCKPIT_HTML = """<!doctype html>
       await loadDashboard();
     }
 
+    async function executePlanAction(action, query) {
+      if (!action || !action.kind || !action.title) return;
+      const payload = await requestJson("/api/execute-plan-action", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          query: query || document.getElementById("query").value.trim() || "what should I do next",
+          kind: action.kind,
+          title: action.title,
+          task_id: action.task_id || null,
+          limit: 5
+        })
+      });
+      currentPlanExplanation = payload.model_explanation || null;
+      setActionBanner("success", "Planner action executed.", summarizeExecution(payload));
+      document.getElementById("execution-output").textContent = JSON.stringify(payload, null, 2);
+      await loadDashboard();
+    }
+
     function taskActionSummary(action, title, payload) {
       if (action === "complete") return `Marked "${title}" complete and refreshed the task list.`;
       if (action === "unblock") return `Removed blockers for "${title}" and refreshed readiness.`;
@@ -1004,6 +1484,7 @@ COCKPIT_HTML = """<!doctype html>
       const pieces = [];
       if (result.status) pieces.push(`Result: ${result.status}.`);
       if (result.message) pieces.push(result.message);
+      if (payload?.model_explanation?.text) pieces.push(payload.model_explanation.text);
       if (recommendation.title) {
         pieces.push(`Next recommendation: ${recommendation.title}.`);
       }
@@ -1067,6 +1548,7 @@ COCKPIT_HTML = """<!doctype html>
         const entity = item.entity || {};
         return entity.name || entity.canonical_name || entity.entity_type || "entity";
       });
+      const taskPlanActions = payload.task_plan_actions || [];
       node.innerHTML = `
         <div class="card">
           <div class="status-line"><span class="eyebrow">${task.subject || "task"}</span>${renderStatePill(meta.status || "open")}</div>
@@ -1079,6 +1561,26 @@ COCKPIT_HTML = """<!doctype html>
             <button class="ghost" data-task-action="resume">Resume</button>
             <button class="ghost" data-task-action="snooze">Snooze 1 day</button>
           </div>
+        </div>
+        <div class="card">
+          <div class="eyebrow">Suggested next moves</div>
+          <div class="body">${taskPlanActions.length ? "These task-specific actions come from the current planner view for this task title." : "No task-scoped planner actions are surfaced for this task yet."}</div>
+          <div class="body muted" style="margin-top:8px;">Prepare = safer preflight. Delegate = tracked handoff. Run = execute the currently bounded step for this task.</div>
+          ${taskPlanActions.length ? `
+            <div style="display:grid; gap:10px; margin-top:12px;">
+              ${taskPlanActions.map((item) => `
+                <div class="card" style="padding:12px; border-radius:16px;">
+                  <div class="status-line"><span class="eyebrow">${item.kind}</span>${renderStatePill("ready")}</div>
+                  <div class="headline">${item.title}</div>
+                  <div class="body">${item.summary}</div>
+                  <div class="body muted" style="margin-top:8px;">${explainPlannerAction(item.kind)}</div>
+                  <div class="actions" style="margin-top:10px;">
+                    <button class="ghost" data-task-plan-run="${item.kind}::${item.title}">Run this step</button>
+                  </div>
+                </div>
+              `).join("")}
+            </div>
+          ` : ""}
         </div>
         <div class="card">
           <div class="eyebrow">Execution shape</div>
@@ -1104,6 +1606,13 @@ COCKPIT_HTML = """<!doctype html>
             return;
           }
           await runTaskAction(action, meta.title || task.content || title, task.subject || area || "execution");
+        });
+      });
+      node.querySelectorAll("[data-task-plan-run]").forEach((button, index) => {
+        button.addEventListener("click", async () => {
+          const action = taskPlanActions[index];
+          if (!action) return;
+          await executePlanAction(action, meta.title || task.content || title);
         });
       });
     }
@@ -1226,13 +1735,16 @@ COCKPIT_HTML = """<!doctype html>
       currentPilotItems.forEach((item) => {
         const action = item.selected_action || {};
         const approval = item.approval || {};
+        const sourceLabel = item.request_origin === "prompt_workshop"
+          ? `Prompt Workshop ${item.prompt_source === "result" ? "result" : "draft"}`
+          : "Manual pilot request";
         const div = document.createElement("div");
         div.className = "card";
         if (item.pending_id === selectedPilotPendingId) {
           div.classList.add("active");
         }
         div.innerHTML = `
-          <div class="status-line"><span class="eyebrow">pilot review</span>${renderStatePill(approval.status || "pending")}</div>
+          <div class="status-line"><span class="eyebrow">${sourceLabel}</span>${renderStatePill(approval.status || "pending")}</div>
           <div class="headline">${action.title || "Pending action"}</div>
           <div class="body">${summarizePilotCard(item)}</div>
           <div class="actions" style="margin-top:12px;">
@@ -1374,6 +1886,52 @@ COCKPIT_HTML = """<!doctype html>
       return pieces.join(" ") || "No additional detail recorded.";
     }
 
+    function isPromptPilotActivity(item) {
+      const tool = item?.metadata?.tool_name || "";
+      return tool === "prompt-pilot-bridge" || tool === "prompt-pilot-execution";
+    }
+
+    function summarizePromptPilotChain(group) {
+      const bridge = group.items.find((entry) => entry?.metadata?.tool_name === "prompt-pilot-bridge") || null;
+      const execution = group.items.find((entry) => entry?.metadata?.tool_name === "prompt-pilot-execution") || null;
+      const promptSource = execution?.metadata?.prompt_source || bridge?.metadata?.prompt_source || "draft";
+      const selectedTitle = execution?.metadata?.selected_action_title || bridge?.metadata?.selected_action_title || "the selected action";
+      const executionStatus = execution?.metadata?.execution_status || execution?.metadata?.status || "";
+      const rejectionReason = execution?.metadata?.rejection_reason || "";
+      const pieces = [
+        `Prompt Workshop ${promptSource} entered the guided loop for ${selectedTitle}.`
+      ];
+      if (bridge) {
+        pieces.push("A pilot review packet was queued for approval.");
+      }
+      if (execution) {
+        if (rejectionReason.startsWith("validation_failed:")) {
+          pieces.push("After approval, the previewed patch was rejected by validation before apply.");
+        } else if (rejectionReason) {
+          pieces.push(`After approval, execution stopped before apply: ${rejectionReason}.`);
+        } else {
+          pieces.push(`After approval, execution finished with status ${executionStatus || "recorded"}.`);
+        }
+      } else {
+        pieces.push("Execution has not been recorded yet.");
+      }
+      return pieces.join(" ");
+    }
+
+    function activityGroupSummary(group) {
+      if (group.items.some(isPromptPilotActivity)) {
+        return summarizePromptPilotChain(group);
+      }
+      return summarizeActivity(group.items[0]);
+    }
+
+    function activityGroupNarrative(group) {
+      if (group.items.some(isPromptPilotActivity)) {
+        return summarizePromptPilotChain(group);
+      }
+      return group.items.map((entry) => summarizeActivity(entry)).join(" ");
+    }
+
     function groupActivity(items) {
       const groups = [];
       items.forEach((item) => {
@@ -1413,9 +1971,9 @@ COCKPIT_HTML = """<!doctype html>
           div.classList.add("active");
         }
         div.innerHTML = `
-          <div class="status-line"><span class="eyebrow">${meta.tool_name || "tool"}</span>${renderStatePill(meta.status || "status")}</div>
+          <div class="status-line"><span class="eyebrow">${group.items.some(isPromptPilotActivity) ? "prompt workshop chain" : meta.tool_name || "tool"}</span>${renderStatePill(meta.status || "status")}</div>
           <div class="headline">${group.topic}</div>
-          <div class="body">${summarizeActivity(item)}</div>
+          <div class="body">${activityGroupSummary(group)}</div>
           <div class="body" style="margin-top:8px;">${group.items.length > 1 ? `${group.items.length} related events are grouped here.` : "Single recorded event."}</div>
         `;
         div.style.cursor = "pointer";
@@ -1445,15 +2003,23 @@ COCKPIT_HTML = """<!doctype html>
       const trustedSummary = approval.category === "trusted_file_operation"
         ? summarizeTrustedApproval(approval)
         : "";
+      const sourceLabel = item.request_origin === "prompt_workshop"
+        ? `Prompt Workshop ${item.prompt_source === "result" ? "result" : "draft"}`
+        : "Manual pilot request";
       node.innerHTML = `
         <div class="card">
-          <div class="status-line"><span class="eyebrow">pilot review</span>${renderStatePill(approval.status || "needs approval")}</div>
+          <div class="status-line"><span class="eyebrow">${sourceLabel}</span>${renderStatePill(approval.status || "needs approval")}</div>
           <div class="headline">${action.title || "Pending action"}</div>
           <div class="body">${approval.prompt || approval.reason || action.summary || ""}</div>
           <div class="actions" style="margin-top:12px;">
             <button id="detail-approve">Approve this action</button>
             <button id="detail-reject" class="ghost">Reject this action</button>
           </div>
+        </div>
+        <div class="card">
+          <div class="eyebrow">Request origin</div>
+          <div class="body">${sourceLabel}.</div>
+          <div class="body" style="margin-top:8px;">${item.request_origin === "prompt_workshop" ? "This preview came from the Prompt Workshop bridge after explicit confirmation." : "This preview came directly from the pilot request box."}</div>
         </div>
         <div class="card">
           <div class="eyebrow">Selected action</div>
@@ -1563,16 +2129,17 @@ COCKPIT_HTML = """<!doctype html>
       }
       const meta = item.metadata || {};
       const related = currentActivityItems.filter((entry) => activityTopic(entry) === activityTopic(item));
+      const relatedGroup = {topic: activityTopic(item), items: related};
       node.innerHTML = `
         <div class="card">
-          <div class="status-line"><span class="eyebrow">${meta.tool_name || "tool"}</span>${renderStatePill(meta.status || "status")}</div>
+          <div class="status-line"><span class="eyebrow">${related.some(isPromptPilotActivity) ? "prompt workshop chain" : meta.tool_name || "tool"}</span>${renderStatePill(meta.status || "status")}</div>
           <div class="headline">${activityTopic(item)}</div>
-          <div class="body">${activityNarrative(item)}</div>
+          <div class="body">${related.some(isPromptPilotActivity) ? activityGroupSummary(relatedGroup) : activityNarrative(item)}</div>
         </div>
         <div class="card">
           <div class="eyebrow">Cause and effect</div>
           <div class="body">${related.length > 1 ? `This topic has ${related.length} related events.` : "This topic has one recorded event."}</div>
-          <div class="body" style="margin-top:8px;">${related.map((entry) => summarizeActivity(entry)).join(" ")}</div>
+          <div class="body" style="margin-top:8px;">${activityGroupNarrative(relatedGroup)}</div>
         </div>
         <div class="card">
           <div class="eyebrow">Metadata</div>
@@ -1586,6 +2153,8 @@ COCKPIT_HTML = """<!doctype html>
       const node = document.getElementById("plan-card");
       node.innerHTML = "";
       const rec = snapshot.plan.recommendation;
+      const alternatives = (snapshot.plan.alternatives || []).slice(0, 3);
+      const planQuery = snapshot.plan.query || document.getElementById("query").value.trim() || "what should I do next";
       if (!rec) {
         node.innerHTML = "<div class='card'><div class='headline'>No recommendation</div><div class='body'>Capture a fresh task or blocker first.</div></div>";
         return;
@@ -1593,7 +2162,7 @@ COCKPIT_HTML = """<!doctype html>
       const reasons = (rec.reasons || []).map(reason => `<li>${reason}</li>`).join("");
       node.innerHTML = `
         <div class="card">
-          <div class="eyebrow">Recommended now</div>
+          <div class="eyebrow">Guided loop · recommended now</div>
           <div class="headline">[${rec.kind}] ${rec.title}</div>
           <div class="body">${rec.summary}</div>
           <div class="status-line" style="margin-top:12px;">
@@ -1601,8 +2170,77 @@ COCKPIT_HTML = """<!doctype html>
             <span>${reasons ? "Review the reasons before executing." : "No extra planner reasons were recorded."}</span>
           </div>
           ${reasons ? `<ul style="margin-top:12px;">${reasons}</ul>` : ""}
+          <div class="actions" style="margin-top:12px;">
+            <button id="plan-run-recommendation">Run this step</button>
+            <button id="plan-explain" class="ghost">Explain with model</button>
+            <button id="plan-refresh" class="ghost">Refresh around this query</button>
+          </div>
+          <div class="body muted" style="margin-top:10px;">Quick loop: review the recommendation, run one bounded step, then inspect the updated recommendation and timeline below.</div>
+        </div>
+        <div class="card">
+          <div class="eyebrow">Model-backed explanation</div>
+          <div class="headline">${currentPlanExplanation?.text ? "Why this step is next" : "No explanation loaded yet"}</div>
+          <div class="body">${currentPlanExplanation?.text || "Use Explain with model to get a bounded explanation of the current recommendation. Planner state remains the hard source of truth."}</div>
+        </div>
+        ${alternatives.length ? `
+          <div class="card">
+            <div class="eyebrow">Other workable options</div>
+            <div style="display:grid; gap:12px; margin-top:8px;">
+              ${alternatives.map((item) => `
+                <div class="card" style="padding:12px; border-radius:16px;">
+                  <div class="status-line"><span class="eyebrow">${item.kind}</span>${renderStatePill("ready")}</div>
+                  <div class="headline">${item.title}</div>
+                  <div class="body">${item.summary}</div>
+                  <div class="actions" style="margin-top:10px;">
+                    <button class="ghost" data-plan-run="${item.kind}::${item.title}">Run instead</button>
+                  </div>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+        ` : ""}
+        <div class="card">
+          <div class="eyebrow">How to use this</div>
+          <div class="body">Use <strong>Run this step</strong> for the planner's current top choice. If you want a different safe option, run one of the alternatives instead. After each step, check the work queue and operator timeline to see what changed.</div>
+          <div class="body muted" style="margin-top:8px;">Prepare = preflight, Delegate = handoff, Run = execute the current bounded step, Verify = check that the last service change actually worked.</div>
         </div>
       `;
+      const runRecommendation = document.getElementById("plan-run-recommendation");
+      if (runRecommendation) {
+        runRecommendation.addEventListener("click", async () => {
+          await executePlanAction(rec, planQuery);
+        });
+      }
+      const refresh = document.getElementById("plan-refresh");
+      const explain = document.getElementById("plan-explain");
+      if (refresh) {
+        refresh.addEventListener("click", async () => {
+          await loadDashboard();
+        });
+      }
+      if (explain) {
+        explain.addEventListener("click", async () => {
+          const payload = await requestJson("/api/explain-plan", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+              query: planQuery,
+              limit: 5
+            })
+          });
+          currentPlanExplanation = payload;
+          setActionBanner("info", "Planner explanation ready.", payload.text || "The current recommendation was explained.");
+          document.getElementById("execution-output").textContent = JSON.stringify(payload, null, 2);
+          renderPlan(snapshot);
+        });
+      }
+      node.querySelectorAll("[data-plan-run]").forEach((button, index) => {
+        button.addEventListener("click", async () => {
+          const action = alternatives[index];
+          if (!action) return;
+          await executePlanAction(action, planQuery);
+        });
+      });
     }
 
     function persistWorkQueuePrefs() {
@@ -1816,6 +2454,7 @@ COCKPIT_HTML = """<!doctype html>
           <div class="eyebrow">Planner recommendation</div>
           <div class="headline">${recommendation?.title || "No recommendation available"}</div>
           <div class="body">${recommendation?.summary || "The planner has not surfaced a recommendation for this focus yet."}</div>
+          <div class="body muted" style="margin-top:8px;">${recommendation ? explainPlannerAction(recommendation.kind) : "No focused planner action is available yet."}</div>
         </div>
         <div class="card">
           <div class="eyebrow">Focused task</div>
@@ -1823,6 +2462,7 @@ COCKPIT_HTML = """<!doctype html>
           <div class="body">${task ? summarizeTaskCard(task) : "The focused task is not in the current open-task list."}</div>
           <div class="actions" style="margin-top:12px;">
             <button class="ghost" id="focused-open-task"${task ? "" : " disabled"}>Open task detail</button>
+            <button id="focused-run-recommendation"${recommendation && task && matchesFocusedTask(recommendation?.title, recommendation?.metadata?.target_task_title) ? "" : " disabled"}>Run focused recommendation</button>
           </div>
         </div>
         <div class="card">
@@ -1864,6 +2504,12 @@ COCKPIT_HTML = """<!doctype html>
       if (openTask && task) {
         openTask.addEventListener("click", async () => {
           await loadTaskDetail(task.metadata?.title || task.content || focusedTaskTitle, task.subject || "");
+        });
+      }
+      const runFocusedRecommendation = document.getElementById("focused-run-recommendation");
+      if (runFocusedRecommendation && recommendation && task && matchesFocusedTask(recommendation?.title, recommendation?.metadata?.target_task_title)) {
+        runFocusedRecommendation.addEventListener("click", async () => {
+          await executePlanAction(recommendation, focusedTaskTitle);
         });
       }
       const openApproval = document.getElementById("focused-open-approval");
@@ -1921,6 +2567,8 @@ COCKPIT_HTML = """<!doctype html>
         metricCard("memories", stats.active_memories) +
         metricCard("ready", stats.ready_tasks) +
         metricCard("overdue", stats.overdue_tasks);
+      renderSoul(settings);
+      renderTutorial(snapshot, settings);
       renderWorkQueue(snapshot);
       renderFocusedStack(snapshot);
       renderPlan(snapshot);
@@ -1934,6 +2582,7 @@ COCKPIT_HTML = """<!doctype html>
       renderActivity(snapshot.recent_activity || []);
       renderOnboarding(settings);
       renderSettings(settings);
+      renderPromptWorkshop();
     }
 
     async function runTaskAction(action, title, area) {
@@ -1966,6 +2615,94 @@ COCKPIT_HTML = """<!doctype html>
       setActionBanner("success", "Note captured.", summary + " The planner and memory view were refreshed.");
       document.getElementById("observe-output").textContent = summary;
       document.getElementById("note").value = "";
+      await loadDashboard();
+    }
+
+    async function runPromptWorkshop(mode) {
+      const draft = document.getElementById("prompt-draft").value.trim();
+      if (!draft) return;
+      rememberPromptHistory(`Before ${workshopModeLabel(mode)} workshop`);
+      const payload = await requestJson("/api/prompt-workshop", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({draft, mode})
+      });
+      currentPromptWorkshop = payload;
+      setActionBanner("info", "Prompt workshop ready.", "This result is quarantined draft help only. It does not enter memory or planning until you explicitly promote it.");
+      renderPromptWorkshop();
+      document.getElementById("prompt-workshop-output").textContent = payload.text || JSON.stringify(payload, null, 2);
+      document.getElementById("execution-output").textContent = JSON.stringify(payload, null, 2);
+    }
+
+    async function adoptPromptWorkshopResult() {
+      if (!currentPromptWorkshop?.text) return;
+      rememberPromptHistory("Before use result as draft");
+      document.getElementById("prompt-draft").value = currentPromptWorkshop.text;
+      setActionBanner("info", "Workshop result copied into draft.", "The rewritten text is still quarantined. Review it, edit it, or promote it explicitly when you are ready.");
+      renderPromptWorkshop();
+    }
+
+    async function promotePromptText(source) {
+      const text = source === "result"
+        ? String(currentPromptWorkshop?.text || "").trim()
+        : document.getElementById("prompt-draft").value.trim();
+      if (!text) return;
+      const payload = await requestJson("/api/prompt-promote", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({text, source})
+      });
+      const sourceLabel = source === "result" ? "workshop result" : "draft prompt";
+      setActionBanner("success", "Prompt promoted to live note.", `The ${sourceLabel} is now stored as live input and can influence memory, planning, and later actions.`);
+      document.getElementById("observe-output").textContent = summarizeObserve("user", text);
+      document.getElementById("prompt-workshop-output").textContent =
+        source === "result"
+          ? "Workshop result promoted to live note."
+          : "Draft prompt promoted to live note.";
+      rememberPromptHistory(`Before promote ${source}`);
+      document.getElementById("prompt-draft").value = "";
+      currentPromptWorkshop = null;
+      renderPromptWorkshop();
+      document.getElementById("execution-output").textContent = JSON.stringify(payload, null, 2);
+      await loadDashboard();
+    }
+
+    async function sendPromptToPilot(source) {
+      const text = source === "result"
+        ? String(currentPromptWorkshop?.text || "").trim()
+        : document.getElementById("prompt-draft").value.trim();
+      if (!text) return;
+      const sourceLabel = source === "result" ? "workshop result" : "draft prompt";
+      const confirmed = window.confirm(
+        `Send this ${sourceLabel} into the guided loop for pilot review?\n\n` +
+        "This promotes the text out of quarantine and queues the normal pilot preview path."
+      );
+      if (!confirmed) {
+        return;
+      }
+      const payload = await requestJson("/api/prompt-pilot", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({text, source, limit: 5, use_model: false})
+      });
+      const approval = payload?.approval || {};
+      const pendingId = payload?.pending_id || "";
+      const detail = approval.status === "needs_approval"
+        ? `It is now waiting in the pilot approval queue${pendingId ? ` as ${pendingId}` : ""}.`
+        : approval.status === "auto_approved"
+          ? "The pilot policy auto-approved the selected action."
+          : "The pilot preview packet was refreshed.";
+      setActionBanner("success", "Prompt sent to guided loop.", `${sourceLabel} moved out of quarantine. ${detail}`);
+      document.getElementById("observe-output").textContent = summarizeObserve("user", text);
+      document.getElementById("prompt-workshop-output").textContent =
+        source === "result"
+          ? "Workshop result sent to guided loop for pilot review."
+          : "Draft prompt sent to guided loop for pilot review.";
+      rememberPromptHistory(`Before send to guided loop ${source}`);
+      document.getElementById("prompt-draft").value = "";
+      currentPromptWorkshop = null;
+      renderPromptWorkshop();
+      document.getElementById("execution-output").textContent = JSON.stringify(payload, null, 2);
       await loadDashboard();
     }
 
@@ -2011,6 +2748,18 @@ COCKPIT_HTML = """<!doctype html>
 
     document.getElementById("refresh").addEventListener("click", loadDashboard);
     document.getElementById("observe").addEventListener("click", observeNote);
+    document.getElementById("prompt-improve").addEventListener("click", async () => runPromptWorkshop("improve"));
+    document.getElementById("prompt-clarify").addEventListener("click", async () => runPromptWorkshop("clarify"));
+    document.getElementById("prompt-shorten").addEventListener("click", async () => runPromptWorkshop("shorten"));
+    document.getElementById("prompt-safety-check").addEventListener("click", async () => runPromptWorkshop("safety_check"));
+    document.getElementById("prompt-undo-history").addEventListener("click", undoPromptHistory);
+    document.getElementById("prompt-replace-selection").addEventListener("click", replacePromptDraftSelection);
+    document.getElementById("prompt-append-result").addEventListener("click", appendPromptWorkshopResult);
+    document.getElementById("prompt-adopt-result").addEventListener("click", adoptPromptWorkshopResult);
+    document.getElementById("prompt-pilot-result").addEventListener("click", async () => sendPromptToPilot("result"));
+    document.getElementById("prompt-pilot").addEventListener("click", async () => sendPromptToPilot("draft"));
+    document.getElementById("prompt-promote-result").addEventListener("click", async () => promotePromptText("result"));
+    document.getElementById("prompt-promote").addEventListener("click", async () => promotePromptText("draft"));
     document.getElementById("execute").addEventListener("click", executeNext);
     document.getElementById("review").addEventListener("click", loadDashboard);
     document.getElementById("pilot-preview").addEventListener("click", previewPilotTurn);
@@ -2067,7 +2816,7 @@ class CockpitService:
     def __init__(self, store: MemoryStore, *, workspace_root: Path | None = None):
         self.store = store
         self.workspace_root = workspace_root or Path.cwd()
-        self.agent = MemoryFirstAgent(store)
+        self.agent = MemoryFirstAgent(store, workspace_root=self.workspace_root)
         self.planner = MemoryPlanner(store)
         self.executor = MemoryExecutor(store)
         self.pilot_policy = LinuxPilotPolicy.load(workspace_root=self.workspace_root)
@@ -2078,11 +2827,13 @@ class CockpitService:
             git_mode=self.pilot_policy.git_write_mode,
         )
         self.pending_pilot_turns: dict[str, PilotTurnReport] = {}
+        self.pending_pilot_contexts: dict[str, dict[str, Any]] = {}
         self.active_sessions: set[str] = set()
         self.service_manager = CockpitServiceManager()
+        self.soul = load_soul_document(self.workspace_root)
 
     def snapshot(self, *, query: str = "what should I do next", limit: int = 5) -> dict[str, Any]:
-        plan = self.planner.build_plan(query, action_limit=limit)
+        plan = self._planner().build_plan(query, action_limit=limit)
         return {
             "stats": self.store.stats(),
             "plan": self._plan_to_json(plan),
@@ -2099,6 +2850,10 @@ class CockpitService:
         context = self.store.build_context(query, memory_limit=limit)
         return self._jsonify(context)
 
+    def explain_plan(self, *, query: str = "what should I do next", limit: int = 5) -> dict[str, Any]:
+        report = self.agent.explain_plan(query, action_limit=limit)
+        return self._jsonify(report)
+
     def observe(self, *, role: str, text: str) -> dict[str, Any]:
         report = self.agent.observe_message(role=role, text=text)
         return {
@@ -2107,9 +2862,143 @@ class CockpitService:
             "plan": self._plan_to_json(report.plan) if report.plan is not None else None,
         }
 
+    def prompt_workshop(self, *, draft: str, mode: str = "improve") -> dict[str, Any]:
+        report = self.agent.workshop_prompt(draft, mode=mode)
+        return self._jsonify(report)
+
+    def promote_prompt_text(self, *, text: str, source: str = "draft") -> dict[str, Any]:
+        report = self.agent.observe_message(role="user", text=text)
+        self.store.record_tool_outcome(
+            "prompt-promote",
+            f"Promoted {source} prompt text into live input.",
+            status="success",
+            subject="prompt-workshop",
+            tags=["prompt-workshop", "prompt-promote"],
+            metadata={
+                "prompt_source": source,
+                "text_preview": text[:160],
+            },
+        )
+        return {
+            "prompt_source": source,
+            "event_id": report.event_id,
+            "stored_memories": [self._memory_to_json(item) for item in report.stored_memories],
+            "plan": self._plan_to_json(report.plan) if report.plan is not None else None,
+        }
+
+    def send_prompt_to_pilot(
+        self,
+        *,
+        text: str,
+        source: str = "draft",
+        action_limit: int = 5,
+        use_model: bool = False,
+    ) -> dict[str, Any]:
+        payload = self.preview_pilot_turn(
+            text=text,
+            action_limit=action_limit,
+            use_model=use_model,
+        )
+        pending_id = str(payload.get("pending_id") or "").strip()
+        if pending_id:
+            context = {
+                "request_origin": "prompt_workshop",
+                "prompt_source": source,
+            }
+            self.pending_pilot_contexts[pending_id] = context
+            payload.update(context)
+        approval = payload.get("approval") or {}
+        selected_action = payload.get("selected_action") or {}
+        self.store.record_tool_outcome(
+            "prompt-pilot-bridge",
+            f"Sent {source} prompt text into the guided loop.",
+            status="success",
+            subject="prompt-workshop",
+            tags=["prompt-workshop", "prompt-pilot"],
+            metadata={
+                "prompt_source": source,
+                "pending_id": payload.get("pending_id"),
+                "approval_status": approval.get("status"),
+                "selected_action_title": selected_action.get("title"),
+                "text_preview": text[:160],
+            },
+        )
+        payload["prompt_source"] = source
+        return payload
+
     def execute_next(self, *, query: str = "what should I do next", limit: int = 5) -> dict[str, Any]:
-        cycle = self.executor.execute_next(query, action_limit=limit)
-        return self._execution_cycle_to_json(cycle)
+        plan_query = query.strip() or "what should I do next"
+        planner = self._planner()
+        before_plan = planner.build_plan(plan_query, action_limit=limit)
+        cycle = ExecutionCycle(
+            query=plan_query,
+            before_plan=before_plan,
+            result=self.executor.execute_action(before_plan.recommendation),
+            after_plan=planner.build_plan(plan_query, action_limit=limit),
+        )
+        payload = self._execution_cycle_to_json(cycle)
+        payload["model_explanation"] = self._jsonify(
+            self.agent.narrate_execution(
+                query=plan_query,
+                before_plan=cycle.before_plan,
+                result=cycle.result,
+                after_plan=cycle.after_plan,
+            )
+        )
+        return payload
+
+    def execute_plan_action(
+        self,
+        *,
+        query: str = "what should I do next",
+        kind: str,
+        title: str,
+        task_id: int | None = None,
+        limit: int = 5,
+    ) -> dict[str, Any]:
+        plan_query = query.strip() or "what should I do next"
+        planner = self._planner()
+        before_plan = planner.build_plan(plan_query, action_limit=limit)
+        selected_action = self._select_plan_action(
+            before_plan,
+            kind=kind,
+            title=title,
+            task_id=task_id,
+        )
+        if selected_action is None:
+            raise KeyError(f"Unknown plan action: {kind}:{title}")
+        cycle = ExecutionCycle(
+            query=plan_query,
+            before_plan=before_plan,
+            result=self.executor.execute_action(selected_action),
+            after_plan=planner.build_plan(plan_query, action_limit=limit),
+        )
+        if self._is_demo_action(selected_action):
+            self._record_demo_event(
+                event="run",
+                outcome=(
+                    f"Ran demo action [{selected_action.kind}] {selected_action.title} "
+                    f"with {cycle.result.status} status."
+                ),
+                titles=[selected_action.title],
+                metadata={
+                    "plan_action_kind": selected_action.kind,
+                    "execution_status": cycle.result.status,
+                    "execution_summary": cycle.result.summary,
+                },
+            )
+        payload = self._execution_cycle_to_json(cycle)
+        payload["model_explanation"] = self._jsonify(
+            self.agent.narrate_execution(
+                query=plan_query,
+                before_plan=cycle.before_plan,
+                result=cycle.result,
+                after_plan=cycle.after_plan,
+            )
+        )
+        payload["selected_action"] = self._jsonify(selected_action)
+        payload["selection_source"] = "explicit_plan_action"
+        return payload
 
     def recent_nudges(self, *, limit: int = 5) -> list[dict[str, Any]]:
         return [self._memory_to_json(item) for item in self.store.get_recent_nudges(limit=limit)]
@@ -2119,6 +3008,7 @@ class CockpitService:
         for pending_id, report in self.pending_pilot_turns.items():
             item = self._pilot_turn_to_json(report)
             item["pending_id"] = pending_id
+            item.update(self.pending_pilot_contexts.get(pending_id, {}))
             payload.append(item)
         payload.sort(key=lambda item: int(item.get("user_event_id", 0) or 0), reverse=True)
         return payload
@@ -2155,15 +3045,51 @@ class CockpitService:
             raise KeyError(f"Unknown pending pilot turn: {pending_id}")
         approved = self.pilot_runtime.approve_turn(report)
         self.pending_pilot_turns.pop(pending_id, None)
+        context = self.pending_pilot_contexts.pop(pending_id, {})
         payload = self._pilot_turn_to_json(approved)
         payload["pending_id"] = pending_id
+        payload.update(context)
+        if context.get("request_origin") == "prompt_workshop":
+            selected_action = payload.get("selected_action") or {}
+            execution_result = payload.get("execution_result") or {}
+            patch_run = execution_result.get("patch_run") or {}
+            rejection_reason = (
+                patch_run.get("rejection_reason")
+                or (execution_result.get("approval") or {}).get("metadata", {}).get("rejection_reason")
+                or ""
+            )
+            prompt_source = str(context.get("prompt_source") or "draft")
+            self.store.record_tool_outcome(
+                "prompt-pilot-execution",
+                (
+                    f"Executed guided-loop action from Prompt Workshop {prompt_source}: "
+                    f"{selected_action.get('title') or 'untitled action'}."
+                ),
+                status=str(execution_result.get("status") or "success"),
+                subject="prompt-workshop",
+                tags=["prompt-workshop", "prompt-pilot", "pilot-execution"],
+                metadata={
+                    "prompt_source": prompt_source,
+                    "request_origin": "prompt_workshop",
+                    "pending_id": pending_id,
+                    "selected_action_title": selected_action.get("title"),
+                    "selected_action_kind": selected_action.get("kind"),
+                    "execution_status": execution_result.get("status"),
+                    "patch_status": patch_run.get("status"),
+                    "rejection_reason": rejection_reason,
+                    "task_title": (
+                        (execution_result.get("related_task") or {}).get("metadata", {}).get("title")
+                    ),
+                },
+            )
         return payload
 
     def reject_pilot_turn(self, *, pending_id: str, reason: str | None = None) -> dict[str, Any]:
         report = self.pending_pilot_turns.pop(pending_id, None)
+        context = self.pending_pilot_contexts.pop(pending_id, {})
         if report is None:
             raise KeyError(f"Unknown pending pilot turn: {pending_id}")
-        return {
+        payload = {
             "pending_id": pending_id,
             "status": "rejected",
             "reason": str(reason or "rejected_by_user").strip() or "rejected_by_user",
@@ -2173,6 +3099,8 @@ class CockpitService:
                 else None
             ),
         }
+        payload.update(context)
+        return payload
 
     def patch_runs(self, *, limit: int = 5) -> list[dict[str, Any]]:
         runs: list[dict[str, Any]] = []
@@ -2207,6 +3135,75 @@ class CockpitService:
             return self._memory_to_json(self.store.unblock_task(title, area=area))
         raise ValueError(f"unsupported_task_action:{action}")
 
+    def seed_demo_workflow(self) -> dict[str, Any]:
+        demo_specs = self._demo_workflow_specs()
+        created_titles: list[str] = []
+        unchanged_titles: list[str] = []
+        for spec in demo_specs:
+            title = str(spec["title"])
+            existing = self.store.find_active_task(title, area=str(spec["area"]))
+            if existing is not None:
+                unchanged_titles.append(title)
+                continue
+            created = self.store.record_task(
+                title,
+                status=str(spec.get("status", "open")),
+                area=str(spec.get("area", "execution")),
+                details=str(spec.get("details") or ""),
+                service_inspection=str(spec.get("service_inspection") or ""),
+                service_label=str(spec.get("service_label") or ""),
+                complete_on_success=bool(spec.get("complete_on_success", False)),
+                tags=list(spec.get("tags") or []),
+            )
+            created_titles.append(str(created.metadata.get("title") or created.content))
+        self._record_demo_event(
+            event="seed",
+            outcome=(
+                f"Seeded demo workflow with {len(created_titles)} new task(s) and "
+                f"{len(unchanged_titles)} existing task(s)."
+            ),
+            titles=created_titles or unchanged_titles,
+            metadata={
+                "created_titles": created_titles,
+                "unchanged_titles": unchanged_titles,
+            },
+        )
+        return {
+            "created_titles": created_titles,
+            "unchanged_titles": unchanged_titles,
+            "open_tasks": [
+                str(task.metadata.get("title") or task.content)
+                for task in self.store.get_open_tasks(limit=8)
+            ],
+        }
+
+    def reset_demo_workflow(self) -> dict[str, Any]:
+        reset_titles: list[str] = []
+        for spec in self._demo_workflow_specs():
+            restored = self.store.record_task(
+                str(spec["title"]),
+                status=str(spec.get("status", "open")),
+                area=str(spec.get("area", "execution")),
+                details=str(spec.get("details") or ""),
+                service_inspection=str(spec.get("service_inspection") or ""),
+                service_label=str(spec.get("service_label") or ""),
+                complete_on_success=bool(spec.get("complete_on_success", False)),
+                tags=list(spec.get("tags") or []),
+            )
+            reset_titles.append(str(restored.metadata.get("title") or restored.content))
+        self._record_demo_event(
+            event="reset",
+            outcome=f"Reset demo workflow to its starting state for {len(reset_titles)} task(s).",
+            titles=reset_titles,
+        )
+        return {
+            "reset_titles": reset_titles,
+            "open_tasks": [
+                str(task.metadata.get("title") or task.content)
+                for task in self.store.get_open_tasks(limit=8)
+            ],
+        }
+
     def task_detail(self, *, title: str, area: str | None = None) -> dict[str, Any]:
         task = self.store.find_active_task(title, area=area, decorate=True)
         if task is None:
@@ -2231,6 +3228,10 @@ class CockpitService:
                 for item in self.store.get_recent_nudges(limit=8)
                 if str(item.metadata.get("task_title") or "").strip().lower() == title.strip().lower()
             ],
+            "task_plan_actions": [
+                self._jsonify(item)
+                for item in self._task_plan_actions(task, limit=6)
+            ],
         }
 
     def recent_activity(self, *, limit: int = 8) -> list[dict[str, Any]]:
@@ -2241,14 +3242,116 @@ class CockpitService:
 
     def settings(self) -> dict[str, Any]:
         payload = self.service_manager.settings()
+        payload["service_sync"] = self.store.sync_service_tasks(payload)
+        payload["service_sync_status"] = self._planner().service_sync_status(payload)
         payload["pilot_policy"] = self._pilot_policy_settings()
+        payload["soul"] = self._soul_settings()
+        payload["soul_audit"] = self._soul_audit(limit=8)
         return self._jsonify(payload)
 
     def rotate_remote_access_token(self) -> dict[str, Any]:
         return self._jsonify(self.service_manager.rotate_remote_token())
 
     def service_action(self, action: str) -> dict[str, Any]:
-        return self._jsonify(self.service_manager.perform_action(action))
+        payload = self.service_manager.perform_action(action)
+        settings = payload.get("settings")
+        if isinstance(settings, dict):
+            payload["service_sync"] = self.store.sync_service_tasks(settings)
+            payload["service_sync_status"] = self._planner().service_sync_status(settings)
+        return self._jsonify(payload)
+
+    def soul_review(self, *, limit: int = 8) -> dict[str, Any]:
+        review = review_soul_document(
+            self.soul,
+            self._recent_user_messages(limit=limit),
+            dismissed_evidence_signatures=self._dismissed_soul_proposal_signatures(limit=32),
+        )
+        self.store.record_tool_outcome(
+            "soul-review",
+            f"Generated {len(review.proposals)} soul amendment proposal(s).",
+            status="success",
+            subject="identity",
+            tags=["soul", "review"],
+            metadata={
+                "proposal_ids": [proposal.proposal_id for proposal in review.proposals],
+                "proposal_count": len(review.proposals),
+            },
+        )
+        return self._jsonify(review)
+
+    def apply_soul_amendment(self, *, proposal_id: str, limit: int = 8) -> dict[str, Any]:
+        review = review_soul_document(
+            self.soul,
+            self._recent_user_messages(limit=limit),
+            dismissed_evidence_signatures=self._dismissed_soul_proposal_signatures(limit=32),
+        )
+        proposal = next(
+            (item for item in review.proposals if item.proposal_id == proposal_id),
+            None,
+        )
+        if proposal is None:
+            raise KeyError(f"Unknown soul proposal: {proposal_id}")
+        self.soul = apply_soul_proposal(self.soul, proposal)
+        self.agent.soul = self.soul
+        updated_review = review_soul_document(
+            self.soul,
+            self._recent_user_messages(limit=limit),
+            dismissed_evidence_signatures=self._dismissed_soul_proposal_signatures(limit=32),
+        )
+        self.store.record_tool_outcome(
+            "soul-apply",
+            f"Applied soul amendment '{proposal.title}'.",
+            status="success",
+            subject="identity",
+            tags=["soul", "apply"],
+            metadata={
+                "proposal_id": proposal.proposal_id,
+                "section": proposal.section,
+                "amendment": proposal.amendment,
+                "evidence_signature": proposal.evidence_signature,
+            },
+        )
+        return {
+            "applied": self._jsonify(proposal),
+            "review": self._jsonify(updated_review),
+            "summary": f"Applied '{proposal.title}' to {self.soul.path.name}.",
+        }
+
+    def dismiss_soul_amendment(self, *, proposal_id: str, limit: int = 8) -> dict[str, Any]:
+        review = review_soul_document(
+            self.soul,
+            self._recent_user_messages(limit=limit),
+            dismissed_evidence_signatures=self._dismissed_soul_proposal_signatures(limit=32),
+        )
+        proposal = next(
+            (item for item in review.proposals if item.proposal_id == proposal_id),
+            None,
+        )
+        if proposal is None:
+            raise KeyError(f"Unknown soul proposal: {proposal_id}")
+        self.store.record_tool_outcome(
+            "soul-dismiss",
+            f"Dismissed soul amendment '{proposal.title}'.",
+            status="dismissed",
+            subject="identity",
+            tags=["soul", "dismiss"],
+            metadata={
+                "proposal_id": proposal.proposal_id,
+                "section": proposal.section,
+                "amendment": proposal.amendment,
+                "evidence_signature": proposal.evidence_signature,
+            },
+        )
+        updated_review = review_soul_document(
+            self.soul,
+            self._recent_user_messages(limit=limit),
+            dismissed_evidence_signatures=self._dismissed_soul_proposal_signatures(limit=32),
+        )
+        return {
+            "dismissed": self._jsonify(proposal),
+            "review": self._jsonify(updated_review),
+            "summary": f"Dismissed '{proposal.title}' for now. It will stay suppressed until the soul or evidence changes.",
+        }
 
     def update_pilot_policy(
         self,
@@ -2256,6 +3359,7 @@ class CockpitService:
         trusted_writes_enabled: bool | None = None,
         trusted_write_operations: list[str] | None = None,
         trusted_write_required_successes: int | None = None,
+        service_sync_suppression_window_seconds: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         policy = LinuxPilotPolicy.load(workspace_root=self.workspace_root)
         valid_operations = {"write_text", "replace_text", "append_text"}
@@ -2284,8 +3388,29 @@ class CockpitService:
             if trusted_write_required_successes < 1 or trusted_write_required_successes > 10:
                 raise ValueError("trusted_write_required_successes_out_of_range")
             required_successes = int(trusted_write_required_successes)
+        suppression_windows = dict(policy.service_sync_suppression_window_seconds)
+        if service_sync_suppression_window_seconds is not None:
+            valid_scopes = {"local_service", "remote_service", "desktop_launcher"}
+            normalized_windows: dict[str, int] = {}
+            for scope, raw_value in service_sync_suppression_window_seconds.items():
+                normalized_scope = str(scope).strip().lower()
+                if normalized_scope not in valid_scopes:
+                    raise ValueError(f"unsupported_service_sync_scope:{normalized_scope}")
+                try:
+                    seconds = int(raw_value)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"service_sync_suppression_window_seconds_must_be_int:{normalized_scope}"
+                    ) from None
+                if seconds < 0 or seconds > 86400:
+                    raise ValueError(
+                        f"service_sync_suppression_window_seconds_out_of_range:{normalized_scope}"
+                    )
+                normalized_windows[normalized_scope] = seconds
+            suppression_windows.update(normalized_windows)
         policy.trusted_auto_approve_file_operations = set(sorted(operations))
         policy.trusted_auto_approve_required_successes = required_successes
+        policy.service_sync_suppression_window_seconds = suppression_windows
         written_to = policy.write()
         self._reload_pilot_runtime()
         return {
@@ -2305,6 +3430,127 @@ class CockpitService:
     def _configured_token(self) -> str:
         return str(getattr(self, "_configured_auth_token", "") or "")
 
+    def _select_plan_action(
+        self,
+        snapshot: PlannerSnapshot,
+        *,
+        kind: str,
+        title: str,
+        task_id: int | None = None,
+    ) -> PlannerAction | None:
+        normalized_kind = str(kind or "").strip().lower()
+        normalized_title = str(title or "").strip().lower()
+        for action in [snapshot.recommendation, *snapshot.alternatives]:
+            if action is None:
+                continue
+            if str(action.kind or "").strip().lower() != normalized_kind:
+                continue
+            if str(action.title or "").strip().lower() != normalized_title:
+                continue
+            if task_id is not None and int(action.task_id or 0) != int(task_id):
+                continue
+            return action
+        return None
+
+    def _task_plan_actions(
+        self,
+        task: MemoryRecord,
+        *,
+        limit: int = 6,
+    ) -> list[PlannerAction]:
+        task_title = str(task.metadata.get("title") or task.content).strip()
+        if not task_title:
+            return []
+        snapshot = self._planner().build_plan(task_title, action_limit=max(limit, 6))
+        matches: list[PlannerAction] = []
+        seen: set[tuple[str, str, int | None]] = set()
+        for action in [snapshot.recommendation, *snapshot.alternatives]:
+            if action is None or not self._action_matches_task(action, task):
+                continue
+            key = (action.kind, action.title, action.task_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append(action)
+        return matches[:limit]
+
+    def _action_matches_task(self, action: PlannerAction, task: MemoryRecord) -> bool:
+        task_title = str(task.metadata.get("title") or task.content).strip().lower()
+        target_task_title = str(action.metadata.get("target_task_title") or "").strip().lower()
+        if action.task_id is not None and int(action.task_id) == int(task.id):
+            return True
+        if target_task_title and target_task_title == task_title:
+            return True
+        if str(action.title or "").strip().lower() == task_title:
+            return True
+        return False
+
+    def _demo_workflow_specs(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "title": "Try cockpit guided loop",
+                "status": "open",
+                "area": "execution",
+                "details": (
+                    "Use Next action or task detail to run one bounded step from the cockpit. "
+                    "This is a safe starter task for your first hands-on walkthrough."
+                ),
+                "tags": ["demo"],
+            },
+            {
+                "title": "Inspect local cockpit service status",
+                "status": "open",
+                "area": "execution",
+                "details": (
+                    "This demo task uses a read-only service inspection so you can test a visible "
+                    "execution path without changing system state."
+                ),
+                "service_inspection": "restart_local_service",
+                "service_label": "Inspect local service status",
+                "complete_on_success": True,
+                "tags": ["service-verification", "demo"],
+            },
+        ]
+
+    def _demo_workflow_titles(self) -> set[str]:
+        return {
+            str(spec.get("title") or "").strip().lower()
+            for spec in self._demo_workflow_specs()
+            if str(spec.get("title") or "").strip()
+        }
+
+    def _is_demo_action(self, action: PlannerAction) -> bool:
+        demo_titles = self._demo_workflow_titles()
+        candidate_titles = {
+            str(action.title or "").strip().lower(),
+            str(action.metadata.get("target_task_title") or "").strip().lower(),
+            str(action.metadata.get("task_title") or "").strip().lower(),
+        }
+        candidate_titles.discard("")
+        return bool(candidate_titles & demo_titles)
+
+    def _record_demo_event(
+        self,
+        *,
+        event: str,
+        outcome: str,
+        titles: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        demo_titles = [str(title).strip() for title in (titles or []) if str(title).strip()]
+        self.store.record_tool_outcome(
+            "demo-workflow",
+            outcome,
+            status="success",
+            subject="demo walkthrough",
+            tags=["demo", "walkthrough"],
+            metadata={
+                "demo_event": str(event).strip() or "event",
+                "demo_titles": demo_titles,
+                **(metadata or {}),
+            },
+        )
+
     def _reload_pilot_runtime(self) -> None:
         self.pilot_policy = LinuxPilotPolicy.load(workspace_root=self.workspace_root)
         self.pilot_runtime = LinuxPilotRuntime(self.store, policy=self.pilot_policy)
@@ -2312,6 +3558,15 @@ class CockpitService:
             self.store,
             workspace_root=self.workspace_root,
             git_mode=self.pilot_policy.git_write_mode,
+        )
+
+    def _planner(self) -> MemoryPlanner:
+        return MemoryPlanner(
+            self.store,
+            service_manager=self.service_manager,
+            service_sync_suppression_window_seconds=(
+                self.pilot_policy.service_sync_suppression_window_seconds
+            ),
         )
 
     def _pilot_policy_settings(self) -> dict[str, Any]:
@@ -2339,8 +3594,55 @@ class CockpitService:
                 "replace_text",
                 "write_text",
             ],
+            "service_sync_supported_scopes": [
+                "desktop_launcher",
+                "local_service",
+                "remote_service",
+            ],
             "trusted_write_recommendations": trusted_write_recommendations,
         }
+
+    def _soul_settings(self) -> dict[str, Any]:
+        return self.soul.ui_summary()
+
+    def _recent_user_messages(self, *, limit: int) -> list[str]:
+        return [
+            event.content
+            for event in self.store.recent_events(limit=max(limit * 2, 8))
+            if str(event.role).strip().lower() == "user"
+        ][-limit:]
+
+    def _dismissed_soul_proposal_signatures(self, *, limit: int) -> list[str]:
+        dismissed: list[str] = []
+        for item in self.store.get_recent_tool_outcomes(limit=max(limit * 3, 12)):
+            tool_name = str(item.metadata.get("tool_name") or "").strip()
+            signature = str(item.metadata.get("evidence_signature") or "").strip()
+            if tool_name == "soul-dismiss" and signature:
+                dismissed.append(signature)
+            if tool_name == "soul-apply" and signature:
+                dismissed = [entry for entry in dismissed if entry != signature]
+        return list(dict.fromkeys(dismissed))
+
+    def _soul_audit(self, *, limit: int) -> list[dict[str, Any]]:
+        audit: list[dict[str, Any]] = []
+        for item in self.store.get_recent_tool_outcomes(limit=max(limit * 3, 12)):
+            tool_name = str(item.metadata.get("tool_name") or "").strip()
+            if tool_name not in {"soul-review", "soul-apply", "soul-dismiss"}:
+                continue
+            audit.append(
+                {
+                    "id": item.id,
+                    "tool_name": tool_name,
+                    "status": str(item.metadata.get("status") or ""),
+                    "outcome": str(item.metadata.get("outcome") or item.content),
+                    "proposal_id": str(item.metadata.get("proposal_id") or ""),
+                    "evidence_signature": str(item.metadata.get("evidence_signature") or ""),
+                    "created_at": item.created_at,
+                }
+            )
+            if len(audit) >= limit:
+                break
+        return audit
 
     def _execution_cycle_to_json(self, cycle: ExecutionCycle) -> dict[str, Any]:
         return {
@@ -2438,6 +3740,18 @@ class CockpitRequestHandler(BaseHTTPRequestHandler):
             limit = self._int_value(params, "limit", 5)
             self._send_json(self.server.cockpit_service.context(query=query, limit=limit))
             return
+        if parsed.path == "/api/explain-plan":
+            self._send_error_json(HTTPStatus.METHOD_NOT_ALLOWED, "post_only")
+            return
+        if parsed.path == "/api/prompt-workshop":
+            self._send_error_json(HTTPStatus.METHOD_NOT_ALLOWED, "post_only")
+            return
+        if parsed.path == "/api/prompt-promote":
+            self._send_error_json(HTTPStatus.METHOD_NOT_ALLOWED, "post_only")
+            return
+        if parsed.path == "/api/prompt-pilot":
+            self._send_error_json(HTTPStatus.METHOD_NOT_ALLOWED, "post_only")
+            return
         if parsed.path == "/api/recent-nudges":
             limit = self._int_value(params, "limit", 5)
             self._send_json(self.server.cockpit_service.recent_nudges(limit=limit))
@@ -2484,6 +3798,36 @@ class CockpitRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(self.server.cockpit_service.observe(role=role, text=text))
             return
+        if parsed.path == "/api/prompt-workshop":
+            draft = str(payload.get("draft", "")).strip()
+            mode = str(payload.get("mode", "improve")).strip() or "improve"
+            self._send_json(self.server.cockpit_service.prompt_workshop(draft=draft, mode=mode))
+            return
+        if parsed.path == "/api/prompt-promote":
+            text = str(payload.get("text", "")).strip()
+            source = str(payload.get("source", "draft")).strip() or "draft"
+            if not text:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, "missing_text")
+                return
+            self._send_json(self.server.cockpit_service.promote_prompt_text(text=text, source=source))
+            return
+        if parsed.path == "/api/prompt-pilot":
+            text = str(payload.get("text", "")).strip()
+            source = str(payload.get("source", "draft")).strip() or "draft"
+            if not text:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, "missing_text")
+                return
+            action_limit = int(payload.get("limit", 5) or 5)
+            use_model = bool(payload.get("use_model", False))
+            self._send_json(
+                self.server.cockpit_service.send_prompt_to_pilot(
+                    text=text,
+                    source=source,
+                    action_limit=action_limit,
+                    use_model=use_model,
+                )
+            )
+            return
         if parsed.path == "/api/session":
             token = str(payload.get("token", "")).strip()
             if not token:
@@ -2498,6 +3842,40 @@ class CockpitRequestHandler(BaseHTTPRequestHandler):
             query = str(payload.get("query", "what should I do next")).strip() or "what should I do next"
             limit = int(payload.get("limit", 5) or 5)
             self._send_json(self.server.cockpit_service.execute_next(query=query, limit=limit))
+            return
+        if parsed.path == "/api/explain-plan":
+            query = str(payload.get("query", "what should I do next")).strip() or "what should I do next"
+            limit = int(payload.get("limit", 5) or 5)
+            self._send_json(self.server.cockpit_service.explain_plan(query=query, limit=limit))
+            return
+        if parsed.path == "/api/execute-plan-action":
+            query = str(payload.get("query", "what should I do next")).strip() or "what should I do next"
+            kind = str(payload.get("kind", "")).strip()
+            title = str(payload.get("title", "")).strip()
+            if not kind or not title:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, "missing_plan_action")
+                return
+            raw_task_id = payload.get("task_id")
+            task_id = None
+            if raw_task_id not in {None, ""}:
+                try:
+                    task_id = int(raw_task_id)
+                except (TypeError, ValueError):
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "task_id_must_be_int")
+                    return
+            limit = int(payload.get("limit", 5) or 5)
+            try:
+                self._send_json(
+                    self.server.cockpit_service.execute_plan_action(
+                        query=query,
+                        kind=kind,
+                        title=title,
+                        task_id=task_id,
+                        limit=limit,
+                    )
+                )
+            except KeyError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
         if parsed.path == "/api/pilot/preview":
             text = str(payload.get("text", "")).strip()
@@ -2577,6 +3955,45 @@ class CockpitRequestHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
+        if parsed.path == "/api/demo/seed":
+            self._send_json(self.server.cockpit_service.seed_demo_workflow())
+            return
+        if parsed.path == "/api/demo/reset":
+            self._send_json(self.server.cockpit_service.reset_demo_workflow())
+            return
+        if parsed.path == "/api/soul/review":
+            self._send_json(self.server.cockpit_service.soul_review())
+            return
+        if parsed.path == "/api/soul/apply":
+            proposal_id = str(payload.get("proposal_id", "")).strip()
+            if not proposal_id:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, "missing_proposal_id")
+                return
+            try:
+                self._send_json(
+                    self.server.cockpit_service.apply_soul_amendment(
+                        proposal_id=proposal_id,
+                    )
+                )
+            except KeyError:
+                self._send_error_json(HTTPStatus.NOT_FOUND, "soul_proposal_not_found")
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if parsed.path == "/api/soul/dismiss":
+            proposal_id = str(payload.get("proposal_id", "")).strip()
+            if not proposal_id:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, "missing_proposal_id")
+                return
+            try:
+                self._send_json(
+                    self.server.cockpit_service.dismiss_soul_amendment(
+                        proposal_id=proposal_id,
+                    )
+                )
+            except KeyError:
+                self._send_error_json(HTTPStatus.NOT_FOUND, "soul_proposal_not_found")
+            return
         if parsed.path == "/api/settings/rotate-remote-token":
             try:
                 self._send_json(self.server.cockpit_service.rotate_remote_access_token())
@@ -2622,12 +4039,34 @@ class CockpitRequestHandler(BaseHTTPRequestHandler):
                         "trusted_write_required_successes_must_be_int",
                     )
                     return
+            raw_suppression_windows = payload.get("service_sync_suppression_window_seconds")
+            service_sync_suppression_window_seconds = None
+            if raw_suppression_windows is not None:
+                if not isinstance(raw_suppression_windows, dict):
+                    self._send_error_json(
+                        HTTPStatus.BAD_REQUEST,
+                        "service_sync_suppression_window_seconds_must_be_object",
+                    )
+                    return
+                service_sync_suppression_window_seconds = {}
+                for scope, raw_value in raw_suppression_windows.items():
+                    try:
+                        service_sync_suppression_window_seconds[str(scope)] = int(raw_value)
+                    except (TypeError, ValueError):
+                        self._send_error_json(
+                            HTTPStatus.BAD_REQUEST,
+                            f"service_sync_suppression_window_seconds_must_be_int:{scope}",
+                        )
+                        return
             try:
                 self._send_json(
                     self.server.cockpit_service.update_pilot_policy(
                         trusted_writes_enabled=trusted_writes_enabled,
                         trusted_write_operations=trusted_write_operations,
                         trusted_write_required_successes=trusted_write_required_successes,
+                        service_sync_suppression_window_seconds=(
+                            service_sync_suppression_window_seconds
+                        ),
                     )
                 )
             except ValueError as exc:

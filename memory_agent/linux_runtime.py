@@ -41,10 +41,15 @@ from .patch_runner import PatchOperation, PatchRunReport, WorkspacePatchRunner
 from .planner import MemoryPlanner, PlannerAction, PlannerSnapshot
 from .shell_adapter import GuardedShellAdapter
 
-DEFAULT_AUTO_APPROVE_ACTION_KINDS = {"ask_user", "noop", "prepare_task", "run_maintenance"}
+DEFAULT_AUTO_APPROVE_ACTION_KINDS = {"ask_user", "noop", "prepare_task", "delegate_task", "run_maintenance"}
 DEFAULT_AUTO_APPROVE_FILE_OPERATIONS = {"read_text"}
 TRUSTED_AUTO_APPROVE_FILE_OPERATIONS = {"write_text", "replace_text", "append_text"}
 TRUSTED_AUTO_APPROVE_REQUIRED_SUCCESSES = 2
+DEFAULT_SERVICE_SYNC_SUPPRESSION_WINDOW_SECONDS = {
+    "local_service": 600,
+    "remote_service": 1800,
+    "desktop_launcher": 1200,
+}
 DEFAULT_AUTO_APPROVE_SHELL_PREFIXES: tuple[tuple[str, ...], ...] = (
     ("python3", "-m", "unittest"),
     ("python3", "-m", "pytest"),
@@ -74,6 +79,7 @@ class LinuxPilotPolicy:
     auto_approve_file_operations: set[str] = field(default_factory=set)
     trusted_auto_approve_file_operations: set[str] = field(default_factory=set)
     trusted_auto_approve_required_successes: int = TRUSTED_AUTO_APPROVE_REQUIRED_SUCCESSES
+    service_sync_suppression_window_seconds: dict[str, int] = field(default_factory=dict)
     auto_approve_shell_prefixes: tuple[tuple[str, ...], ...] = field(default_factory=tuple)
     loaded_from: str | None = None
 
@@ -91,6 +97,9 @@ class LinuxPilotPolicy:
             auto_approve_file_operations=set(DEFAULT_AUTO_APPROVE_FILE_OPERATIONS),
             trusted_auto_approve_file_operations=set(TRUSTED_AUTO_APPROVE_FILE_OPERATIONS),
             trusted_auto_approve_required_successes=TRUSTED_AUTO_APPROVE_REQUIRED_SUCCESSES,
+            service_sync_suppression_window_seconds=dict(
+                DEFAULT_SERVICE_SYNC_SUPPRESSION_WINDOW_SECONDS
+            ),
             auto_approve_shell_prefixes=tuple(DEFAULT_AUTO_APPROVE_SHELL_PREFIXES),
         )
 
@@ -111,6 +120,7 @@ class LinuxPilotPolicy:
         payload = tomllib.loads(policy_path.read_text(encoding="utf-8"))
         general = payload.get("general", {})
         approvals = payload.get("approvals", {})
+        service_sync = payload.get("service_sync", {})
         if isinstance(general, dict):
             name = str(general.get("name") or "").strip()
             if name:
@@ -171,6 +181,21 @@ class LinuxPilotPolicy:
                     if parsed:
                         parsed_prefixes.append(parsed)
                 policy.auto_approve_shell_prefixes = tuple(parsed_prefixes)
+        if isinstance(service_sync, dict):
+            raw_windows = service_sync.get("suppression_window_seconds")
+            if isinstance(raw_windows, dict):
+                parsed_windows: dict[str, int] = {}
+                for scope, raw_value in raw_windows.items():
+                    normalized_scope = str(scope).strip().lower()
+                    if not normalized_scope:
+                        continue
+                    if not isinstance(raw_value, int) or raw_value < 0:
+                        continue
+                    parsed_windows[normalized_scope] = raw_value
+                if parsed_windows:
+                    merged_windows = dict(DEFAULT_SERVICE_SYNC_SUPPRESSION_WINDOW_SECONDS)
+                    merged_windows.update(parsed_windows)
+                    policy.service_sync_suppression_window_seconds = merged_windows
 
         policy.loaded_from = str(policy_path)
         return policy
@@ -190,6 +215,9 @@ class LinuxPilotPolicy:
             ),
             "trusted_auto_approve_required_successes": (
                 self.trusted_auto_approve_required_successes
+            ),
+            "service_sync_suppression_window_seconds": dict(
+                sorted(self.service_sync_suppression_window_seconds.items())
             ),
             "auto_approve_shell_prefixes": [
                 " ".join(prefix) for prefix in self.auto_approve_shell_prefixes
@@ -231,6 +259,12 @@ class LinuxPilotPolicy:
             f"{self._toml_string(item)},"
             for item in sorted(self.trusted_auto_approve_file_operations)
         )
+        suppression_window_lines = "\n".join(
+            f"{self._toml_string(scope)} = {seconds}"
+            for scope, seconds in sorted(
+                self.service_sync_suppression_window_seconds.items()
+            )
+        )
         return (
             "# Supervised Linux pilot policy for the memory-first agent\n"
             "[general]\n"
@@ -254,6 +288,9 @@ class LinuxPilotPolicy:
             "auto_approve_shell_prefixes = [\n"
             f"{self._indent_block(shell_lines)}\n"
             "]\n"
+            "\n[service_sync]\n"
+            "[service_sync.suppression_window_seconds]\n"
+            f"{self._indent_block(suppression_window_lines)}\n"
         )
 
     def is_auto_approved_shell(self, command_text: str) -> bool:
@@ -458,7 +495,11 @@ class LinuxPilotRuntime:
             workspace_root=self.policy.workspace_root,
             git_mode=self.policy.git_write_mode,
         )
-        self.agent = MemoryFirstAgent(memory_store, model_adapter=self.model_adapter)
+        self.agent = MemoryFirstAgent(
+            memory_store,
+            model_adapter=self.model_adapter,
+            workspace_root=self.policy.workspace_root,
+        )
 
     def run_turn(
         self,
@@ -814,9 +855,53 @@ class LinuxPilotRuntime:
                     f"Preparation action '{action.title}' only restructures work into a safer step."
                 ),
             )
+        if action.kind == "delegate_task":
+            return ApprovalDecision(
+                status="auto_approved",
+                category="delegate_task",
+                reason=(
+                    f"Delegation action '{action.title}' only restructures work into a tracked child task."
+                ),
+            )
         if action.kind == "work_task":
             task = self._resolve_task(action)
             return self._approval_for_task_record(task, action=action, source="work_task")
+        if action.kind == "batch_ready_tasks":
+            batch_tasks = self._resolve_batch_targets(action)
+            if not batch_tasks:
+                return ApprovalDecision(
+                    status="auto_approved",
+                    category="missing_batch",
+                    reason="Ready-task batch could not be resolved ahead of execution.",
+                )
+            for task in batch_tasks:
+                task_title = str(task.metadata.get("title") or task.content)
+                decision = self._approval_for_task_record(
+                    task,
+                    action=PlannerAction(
+                        kind="work_task",
+                        title=task_title,
+                        summary=f"Work on '{task_title}' as part of a ready batch.",
+                        score=action.score,
+                        task_id=task.id,
+                        metadata={"area": task.subject},
+                    ),
+                    source="batch_ready_tasks",
+                )
+                if decision.status != "auto_approved":
+                    decision.metadata = {
+                        **dict(decision.metadata),
+                        "batch_task_title": task_title,
+                    }
+                    return decision
+            return ApprovalDecision(
+                status="auto_approved",
+                category="batch_ready_tasks",
+                reason=(
+                    f"Ready-task batch '{action.title}' only contains auto-approved tasks."
+                ),
+                metadata={"task_count": len(batch_tasks)},
+            )
         if action.kind == "resolve_blocker":
             reroute_target = self._resolve_blocker_target(action)
             if reroute_target is None:
@@ -870,6 +955,27 @@ class LinuxPilotRuntime:
             return blocker_task
         return None
 
+    def _resolve_batch_targets(self, action: PlannerAction) -> list[MemoryRecord]:
+        targets: list[MemoryRecord] = []
+        seen_ids: set[int] = set()
+        for task_id in action.metadata.get("task_ids", []):
+            try:
+                candidate = self.memory_store.get_memory(int(task_id))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if candidate.archived_at is not None:
+                continue
+            decorated = self.memory_store.find_active_task(
+                str(candidate.metadata.get("title") or candidate.content),
+                area=candidate.subject,
+                decorate=True,
+            ) or candidate
+            if decorated.id in seen_ids:
+                continue
+            seen_ids.add(decorated.id)
+            targets.append(decorated)
+        return targets
+
     def _approval_for_task_record(
         self,
         task: MemoryRecord | None,
@@ -884,15 +990,42 @@ class LinuxPilotRuntime:
                 reason=f"Task '{action.title}' could not be resolved ahead of execution.",
             )
         command = str(task.metadata.get("command") or "").strip()
+        service_action = str(task.metadata.get("service_action") or "").strip()
+        service_inspection = str(task.metadata.get("service_inspection") or "").strip()
+        service_label = str(task.metadata.get("service_label") or "").strip()
+        service_confirmation_message = str(
+            task.metadata.get("service_confirmation_message") or ""
+        ).strip()
         file_operation = str(task.metadata.get("file_operation") or "").strip()
         file_path = str(task.metadata.get("file_path") or "").strip()
         task_title = str(task.metadata.get("title") or action.title).strip() or action.title
-        if command and file_operation:
+        latest_prep_inspection = self._latest_prep_inspection_summary(task)
+        if not latest_prep_inspection:
+            latest_prep_inspection = str(
+                action.metadata.get("latest_prep_inspection") or ""
+            ).strip()
+        if not latest_prep_inspection:
+            refreshed_task = self.memory_store.find_active_task(
+                task_title,
+                area=task.subject,
+                decorate=True,
+            )
+            if refreshed_task is not None:
+                latest_prep_inspection = self._latest_prep_inspection_summary(
+                    refreshed_task
+                )
+        configured_modes = [
+            bool(command),
+            bool(service_action),
+            bool(service_inspection),
+            bool(file_operation),
+        ]
+        if sum(1 for item in configured_modes if item) > 1:
             return ApprovalDecision(
                 status="needs_approval",
                 category="ambiguous_execution",
                 reason=(
-                    f"Task '{action.title}' defines both shell and file execution metadata."
+                    f"Task '{action.title}' defines multiple execution modes."
                 ),
                 prompt=(
                     f"Approval required because '{action.title}' needs execution metadata cleaned up "
@@ -1009,12 +1142,67 @@ class LinuxPilotRuntime:
                 prompt=f"Approval required before running shell command '{command}'.",
                 metadata={"source": source, "command": command},
             )
+        if service_inspection:
+            return ApprovalDecision(
+                status="auto_approved",
+                category="service_inspection",
+                reason=(
+                    f"Service inspection '{service_label or service_inspection}' is read-only and auto-approved."
+                ),
+                metadata={
+                    "source": source,
+                    "service_inspection": service_inspection,
+                    "service_label": service_label or service_inspection,
+                    "execution_task_title": task_title,
+                },
+            )
+        if service_action:
+            prompt = (
+                service_confirmation_message
+                or (
+                    f"Approval required before running service action '{service_action}' "
+                    f"for '{task_title}'."
+                )
+            )
+            if latest_prep_inspection:
+                prompt = f"{prompt}\nLatest prep inspection: {latest_prep_inspection}"
+            return ApprovalDecision(
+                status="needs_approval",
+                category="service_action",
+                reason=f"Service action '{service_label or service_action}' requires approval.",
+                prompt=prompt,
+                metadata={
+                    "source": source,
+                    "service_action": service_action,
+                    "service_label": service_label or service_action,
+                    "service_requires_confirmation": bool(
+                        task.metadata.get("service_requires_confirmation", False)
+                    ),
+                    "latest_prep_inspection": latest_prep_inspection or None,
+                    "execution_task_title": task_title,
+                },
+            )
         return ApprovalDecision(
             status="auto_approved",
             category="task_state",
             reason=f"Task '{action.title}' only changes task state and is auto-approved.",
             metadata={"source": source},
         )
+
+    def _latest_prep_inspection_summary(self, task: MemoryRecord) -> str:
+        prefix = "Latest prep inspection:"
+        detail_sources = [
+            str(task.metadata.get("details") or "").strip(),
+            str(task.content or "").strip(),
+        ]
+        for source in detail_sources:
+            if not source:
+                continue
+            for line in reversed(source.splitlines()):
+                clean_line = line.strip()
+                if clean_line.startswith(prefix):
+                    return clean_line[len(prefix):].strip()
+        return ""
 
     def _build_patch_preview(
         self,

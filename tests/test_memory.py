@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 import unittest
 import uuid
 import zipfile
@@ -12,7 +13,7 @@ import subprocess
 from argparse import Namespace
 
 import memory_agent.cli as cli_module
-from memory_agent.cockpit import CockpitService
+from memory_agent.cockpit import COCKPIT_HTML, CockpitService
 from memory_agent.agent import MemoryFirstAgent
 from memory_agent.cli import _resolve_patch_run_args, _resolve_serve_config, _run_pilot_chat, build_parser
 from memory_agent.evaluation import (
@@ -30,7 +31,7 @@ from memory_agent.migration import ProjectHandoffManager
 from memory_agent.model_adapter import BaseModelAdapter, ModelMessage, ModelResponse, OllamaChatAdapter
 from memory_agent.models import MemoryDraft
 from memory_agent.patch_runner import PatchOperation, WorkspacePatchRunner
-from memory_agent.planner import MemoryPlanner
+from memory_agent.planner import MemoryPlanner, PlannerAction
 from memory_agent.reranker import OptionalSemanticReranker
 from memory_agent.service_manager import CockpitServiceManager
 from memory_agent.shell_adapter import GuardedShellAdapter
@@ -533,6 +534,225 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(snapshot.recommendation.kind, "run_maintenance")
         self.assertIn("maintenance_due=", " ".join(snapshot.recommendation.reasons))
 
+    def test_service_sync_status_marks_missing_recommended_service_tasks_due(self) -> None:
+        status = self.store.service_sync_status(
+            {
+                "onboarding": {
+                    "actions": [
+                        {
+                            "action": "install_local_service",
+                            "label": "Install local service",
+                            "enabled": True,
+                        }
+                    ]
+                }
+            }
+        )
+
+        self.assertTrue(status["due"])
+        self.assertEqual(status["recommended_actions"], ["install_local_service"])
+        self.assertEqual(
+            status["missing_titles"],
+            ["Cockpit setup: Install local service"],
+        )
+
+    def test_planner_recommends_maintenance_when_service_sync_is_due(self) -> None:
+        class FakeServiceManager:
+            def settings(self) -> dict[str, object]:
+                return {
+                    "onboarding": {
+                        "actions": [
+                            {
+                                "action": "install_remote_service",
+                                "label": "Install remote service",
+                                "description": "Install or repair remote access.",
+                                "enabled": True,
+                            }
+                        ]
+                    }
+                }
+
+        planner = MemoryPlanner(self.store, service_manager=FakeServiceManager())
+        snapshot = planner.build_plan("what should I do next", action_limit=3)
+
+        self.assertIsNotNone(snapshot.recommendation)
+        self.assertEqual(snapshot.recommendation.kind, "run_maintenance")
+        self.assertIn("maintenance_due=service_sync", " ".join(snapshot.recommendation.reasons))
+        self.assertIn("service_sync_recommended=1", snapshot.recommendation.reasons)
+
+    def test_planner_suppresses_service_sync_after_recent_healthy_verification(self) -> None:
+        class FakeServiceManager:
+            def settings(self) -> dict[str, object]:
+                return {
+                    "onboarding": {
+                        "actions": [
+                            {
+                                "action": "install_remote_service",
+                                "label": "Install remote service",
+                                "description": "Install or repair remote access.",
+                                "enabled": True,
+                            }
+                        ]
+                    }
+                }
+
+        self.store.record_tool_outcome(
+            "service_manager",
+            "Healthy remote verification just completed.",
+            status="success",
+            subject="execution",
+            tags=["executor", "service_inspection", "success"],
+            metadata={
+                "service_inspection": "restart_remote_service",
+                "service_inspection_healthy": True,
+                "resolved_service_sync_titles": ["Cockpit setup: Install remote service"],
+            },
+        )
+
+        planner = MemoryPlanner(self.store, service_manager=FakeServiceManager())
+        snapshot = planner.build_plan("what should I do next", action_limit=3)
+
+        self.assertFalse(snapshot.maintenance["service_sync"]["due"])
+        self.assertEqual(snapshot.maintenance["service_sync"]["recommended_actions"], [])
+        self.assertEqual(
+            snapshot.maintenance["service_sync"]["suppressed_recent_verification_actions"],
+            ["install_remote_service"],
+        )
+        self.assertEqual(
+            snapshot.maintenance["service_sync"]["suppressed_recent_verification_titles"],
+            ["Cockpit setup: Install remote service"],
+        )
+        self.assertIsNotNone(
+            snapshot.maintenance["service_sync"]["suppressed_recent_verification_updated_at"]
+        )
+        self.assertGreaterEqual(
+            snapshot.maintenance["service_sync"]["suppressed_recent_verification_age_seconds"],
+            0,
+        )
+        self.assertGreater(
+            snapshot.maintenance["service_sync"]["suppressed_recent_verification_expires_in_seconds"],
+            0,
+        )
+        self.assertTrue(
+            snapshot.recommendation is None
+            or snapshot.recommendation.kind != "run_maintenance"
+        )
+
+    def test_planner_uses_scope_specific_service_sync_suppression_windows(self) -> None:
+        class FakeServiceManager:
+            def settings(self) -> dict[str, object]:
+                return {
+                    "onboarding": {
+                        "actions": [
+                            {
+                                "action": "install_local_service",
+                                "label": "Install local service",
+                                "description": "Install the local cockpit service.",
+                                "enabled": True,
+                            },
+                            {
+                                "action": "install_remote_service",
+                                "label": "Install remote service",
+                                "description": "Install or repair remote access.",
+                                "enabled": True,
+                            },
+                        ]
+                    }
+                }
+
+        local_verification = self.store.record_tool_outcome(
+            "service_manager",
+            "Healthy local verification completed.",
+            status="success",
+            subject="execution",
+            tags=["executor", "service_inspection", "success"],
+            metadata={
+                "service_inspection": "restart_local_service",
+                "service_inspection_healthy": True,
+                "resolved_service_sync_titles": ["Cockpit setup: Install local service"],
+            },
+        )
+        remote_verification = self.store.record_tool_outcome(
+            "service_manager",
+            "Healthy remote verification completed.",
+            status="success",
+            subject="execution",
+            tags=["executor", "service_inspection", "success"],
+            metadata={
+                "service_inspection": "restart_remote_service",
+                "service_inspection_healthy": True,
+                "resolved_service_sync_titles": ["Cockpit setup: Install remote service"],
+            },
+        )
+        backdated = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+        self.store.connection.execute(
+            "update memories set updated_at = ? where id in (?, ?)",
+            (backdated, local_verification.id, remote_verification.id),
+        )
+        self.store.connection.commit()
+
+        planner = MemoryPlanner(self.store, service_manager=FakeServiceManager())
+        status = planner.service_sync_status()
+
+        self.assertTrue(status["due"])
+        self.assertEqual(status["recommended_actions"], ["install_local_service"])
+        self.assertEqual(status["missing_titles"], ["Cockpit setup: Install local service"])
+        self.assertEqual(status["suppressed_recent_verification_scopes"], ["remote_service"])
+        self.assertEqual(
+            status["suppressed_recent_verification_actions"],
+            ["install_remote_service"],
+        )
+        self.assertEqual(
+            status["suppressed_recent_verification_titles"],
+            ["Cockpit setup: Install remote service"],
+        )
+        self.assertGreater(status["suppressed_recent_verification_age_seconds"], 0)
+        self.assertGreater(
+            status["suppressed_recent_verification_expires_in_seconds"],
+            0,
+        )
+
+    def test_planner_routes_confirmation_heavy_service_tasks_to_preparation(self) -> None:
+        self.store.record_task(
+            "Restart local cockpit service",
+            status="open",
+            area="execution",
+            details=(
+                "Confirm reconnect timing.\n"
+                "Latest prep inspection: status=inactive, active=no. Verification target: http://127.0.0.1:8765/"
+            ),
+            service_action="restart_local_service",
+            service_label="Restart local service",
+            complete_on_success=True,
+        )
+        self.store.record_task(
+            "Restart remote cockpit service",
+            status="open",
+            area="execution",
+            service_action="restart_remote_service",
+            service_label="Restart remote service",
+            service_requires_confirmation=True,
+            service_confirmation_message="Restart remote access for this machine?",
+            complete_on_success=True,
+        )
+
+        planner = MemoryPlanner(self.store)
+        snapshot = planner.build_plan("restart service", action_limit=3)
+
+        self.assertIsNotNone(snapshot.recommendation)
+        self.assertEqual(snapshot.recommendation.kind, "prepare_task")
+        self.assertEqual(
+            snapshot.recommendation.title,
+            "Prepare safer execution for Restart remote cockpit service",
+        )
+        self.assertIn("service_confirmation_required", snapshot.recommendation.reasons)
+        local_action = next(
+            action
+            for action in snapshot.alternatives
+            if action.title == "Restart local cockpit service"
+        )
+        self.assertIn("service_low_friction", local_action.reasons)
+
     def test_planner_uses_pilot_history_to_prefer_safe_ready_work(self) -> None:
         for index in range(2):
             self.store.record_tool_outcome(
@@ -639,6 +859,185 @@ class MemoryStoreTests(unittest.TestCase):
                 reason.startswith("pilot_history=approval_friction")
                 for reason in snapshot.recommendation.reasons
             )
+        )
+
+    def test_planner_can_propose_preparation_for_confirmation_heavy_service_task(self) -> None:
+        self.store.record_task(
+            "Restart remote cockpit service",
+            status="open",
+            area="execution",
+            service_action="restart_remote_service",
+            service_label="Restart remote service",
+            service_requires_confirmation=True,
+            service_confirmation_message=(
+                "Restart remote access for this machine? Existing remote browser sessions may need to reconnect afterward."
+            ),
+            complete_on_success=True,
+        )
+
+        planner = MemoryPlanner(self.store)
+        snapshot = planner.build_plan("what should I do next", action_limit=3)
+
+        self.assertIsNotNone(snapshot.recommendation)
+        self.assertEqual(snapshot.recommendation.kind, "prepare_task")
+        self.assertEqual(
+            snapshot.recommendation.title,
+            "Prepare safer execution for Restart remote cockpit service",
+        )
+        self.assertIn("service_confirmation_required", snapshot.recommendation.reasons)
+        prep_details = str(snapshot.recommendation.metadata.get("prep_task_details") or "")
+        self.assertIn("1. Inspect current service state", prep_details)
+        self.assertIn("2. Capture the approval-sensitive change", prep_details)
+        self.assertIn("3. Define the post-action verification", prep_details)
+        self.assertIn("Restart remote access for this machine?", prep_details)
+
+    def test_planner_can_propose_safe_ready_batch_when_query_requests_it(self) -> None:
+        first = self.temp_root / f"{uuid.uuid4().hex}_planner_batch_first.txt"
+        second = self.temp_root / f"{uuid.uuid4().hex}_planner_batch_second.txt"
+        self.extra_paths.extend([first, second])
+        first.write_text("one\n", encoding="utf-8")
+        second.write_text("two\n", encoding="utf-8")
+
+        self.store.record_task(
+            "Batch read first file",
+            status="open",
+            area="execution",
+            file_operation="read_text",
+            file_path=str(first.relative_to(Path.cwd())),
+            complete_on_success=True,
+        )
+        self.store.record_task(
+            "Batch read second file",
+            status="open",
+            area="execution",
+            file_operation="read_text",
+            file_path=str(second.relative_to(Path.cwd())),
+            complete_on_success=True,
+        )
+
+        planner = MemoryPlanner(self.store)
+        snapshot = planner.build_plan("batch the safe ready tasks", action_limit=3)
+
+        self.assertIsNotNone(snapshot.recommendation)
+        self.assertEqual(snapshot.recommendation.kind, "batch_ready_tasks")
+        self.assertEqual(
+            snapshot.recommendation.metadata.get("task_titles"),
+            ["Batch read first file", "Batch read second file"],
+        )
+        self.assertIn("batch_requested", snapshot.recommendation.reasons)
+
+    def test_planner_prioritizes_post_action_service_verification(self) -> None:
+        self.store.record_task(
+            "Routine safe read",
+            status="open",
+            area="execution",
+            file_operation="read_text",
+            file_path=".test_tmp/routine_safe_read.txt",
+            complete_on_success=True,
+        )
+        self.store.record_task(
+            "Verify Restart local cockpit service",
+            status="open",
+            area="execution",
+            details=(
+                "Confirm the post-action state after 'Restart local service'. "
+                "Verification target: http://127.0.0.1:8765/."
+            ),
+            service_inspection="restart_local_service",
+            service_label="Restart local service",
+            complete_on_success=True,
+            tags=["service-verification", "post-action"],
+        )
+
+        planner = MemoryPlanner(self.store)
+        snapshot = planner.build_plan("what should I do next", action_limit=3)
+
+        self.assertIsNotNone(snapshot.recommendation)
+        self.assertEqual(snapshot.recommendation.title, "Verify Restart local cockpit service")
+        self.assertIn("post_action_verification", snapshot.recommendation.reasons)
+        self.assertIn("verification_follow_up", snapshot.recommendation.reasons)
+
+    def test_planner_can_propose_delegation_when_query_requests_it(self) -> None:
+        self.store.record_task(
+            "Delegate quarterly report",
+            status="open",
+            area="execution",
+        )
+
+        planner = MemoryPlanner(self.store)
+        snapshot = planner.build_plan("delegate the quarterly report task", action_limit=3)
+
+        self.assertIsNotNone(snapshot.recommendation)
+        self.assertEqual(snapshot.recommendation.kind, "delegate_task")
+        self.assertEqual(
+            snapshot.recommendation.metadata.get("target_task_title"),
+            "Delegate quarterly report",
+        )
+        self.assertIn("delegation_requested", snapshot.recommendation.reasons)
+
+    def test_executor_runs_safe_ready_batch(self) -> None:
+        first = self.temp_root / f"{uuid.uuid4().hex}_executor_batch_first.txt"
+        second = self.temp_root / f"{uuid.uuid4().hex}_executor_batch_second.txt"
+        self.extra_paths.extend([first, second])
+        first.write_text("one\n", encoding="utf-8")
+        second.write_text("two\n", encoding="utf-8")
+
+        self.store.record_task(
+            "Batch read first file",
+            status="open",
+            area="execution",
+            file_operation="read_text",
+            file_path=str(first.relative_to(Path.cwd())),
+            complete_on_success=True,
+        )
+        self.store.record_task(
+            "Batch read second file",
+            status="open",
+            area="execution",
+            file_operation="read_text",
+            file_path=str(second.relative_to(Path.cwd())),
+            complete_on_success=True,
+        )
+
+        executor = MemoryExecutor(self.store)
+        cycle = executor.execute_next("batch the safe ready tasks", action_limit=3)
+
+        self.assertEqual(cycle.result.executed_kind, "batch_ready_tasks")
+        self.assertEqual(cycle.result.status, "success")
+        batch_results = cycle.result.metadata.get("batch_results") or []
+        self.assertEqual(len(batch_results), 2)
+        self.assertEqual(
+            [item.get("title") for item in batch_results],
+            ["Batch read first file", "Batch read second file"],
+        )
+        ready_titles = [
+            task.metadata.get("title") for task in self.store.get_ready_tasks(limit=5)
+        ]
+        self.assertNotIn("Batch read first file", ready_titles)
+        self.assertNotIn("Batch read second file", ready_titles)
+
+    def test_executor_creates_delegated_child_task(self) -> None:
+        self.store.record_task(
+            "Delegate quarterly report",
+            status="open",
+            area="execution",
+        )
+
+        executor = MemoryExecutor(self.store)
+        cycle = executor.execute_next("delegate the quarterly report task", action_limit=3)
+
+        self.assertEqual(cycle.result.executed_kind, "delegate_task")
+        self.assertEqual(cycle.result.status, "success")
+        self.assertIsNotNone(cycle.result.related_task)
+        self.assertEqual(
+            cycle.result.related_task.metadata.get("title"),
+            "Delegate work for Delegate quarterly report",
+        )
+        self.assertEqual(cycle.result.related_task.metadata.get("owner"), "delegate")
+        self.assertEqual(cycle.result.task_update.metadata.get("status"), "blocked")
+        self.assertIn(
+            "Delegate work for Delegate quarterly report",
+            cycle.result.task_update.metadata.get("blocked_by", []),
         )
 
     def test_executor_starts_ready_task_and_logs_outcome(self) -> None:
@@ -824,6 +1223,433 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(cycle.result.task_update.metadata.get("status"), "done")
         self.assertEqual(target.read_text(encoding="utf-8"), "alpha\ngamma\n")
         self.assertIn("Ran file operation for 'Update local fixture'", cycle.result.tool_outcome.content)
+
+    def test_executor_runs_service_action_and_completes_task(self) -> None:
+        self.store.record_task(
+            "Verify Install local cockpit service",
+            status="open",
+            area="execution",
+            details="Confirm old local service install state.",
+            service_inspection="install_local_service",
+            service_label="Install local service",
+            complete_on_success=True,
+            tags=["service-verification", "post-action"],
+        )
+        self.store.record_task(
+            "Restart local cockpit service",
+            status="open",
+            area="execution",
+            service_action="restart_local_service",
+            service_label="Restart local service",
+            complete_on_success=True,
+        )
+
+        class FakeServiceManager:
+            def perform_action(self, action: str) -> dict[str, object]:
+                self.last_action = action
+                return {
+                    "action": action,
+                    "message": "Local cockpit service restarted.",
+                    "result": {"ok": True},
+                    "verification_target": "http://127.0.0.1:8765/",
+                    "settings": {"local_service": {"active": True}},
+                }
+
+        service_manager = FakeServiceManager()
+        executor = MemoryExecutor(self.store, service_manager=service_manager)
+        cycle = executor.execute_action(
+            PlannerAction(
+                kind="work_task",
+                title="Restart local cockpit service",
+                summary="Run the local service restart task.",
+                score=0.9,
+                metadata={"area": "execution"},
+            )
+        )
+
+        self.assertEqual(service_manager.last_action, "restart_local_service")
+        self.assertEqual(cycle.executed_kind, "run_service_action")
+        self.assertEqual(cycle.status, "success")
+        self.assertEqual(cycle.task_update.metadata.get("status"), "done")
+        self.assertEqual(cycle.metadata.get("service_action"), "restart_local_service")
+        self.assertEqual(
+            cycle.metadata.get("verification_task_title"),
+            "Verify Restart local cockpit service",
+        )
+        self.assertIsNotNone(cycle.related_task)
+        self.assertEqual(
+            cycle.related_task.metadata.get("title"),
+            "Verify Restart local cockpit service",
+        )
+        self.assertEqual(
+            cycle.related_task.metadata.get("service_inspection"),
+            "restart_local_service",
+        )
+        self.assertTrue(cycle.related_task.metadata.get("complete_on_success"))
+        self.assertIn(
+            "Superseded older verification task(s): Verify Install local cockpit service.",
+            str(cycle.related_task.metadata.get("details") or ""),
+        )
+        self.assertIn(
+            "Verification target: http://127.0.0.1:8765/",
+            str(cycle.related_task.metadata.get("details") or ""),
+        )
+        superseded = next(
+            task
+            for task in self.store._active_task_memories()
+            if task.subject == "execution"
+            and str(task.metadata.get("title") or "") == "Verify Install local cockpit service"
+            and str(task.metadata.get("status") or "") == "done"
+        )
+        self.assertIsNotNone(superseded)
+        self.assertEqual(superseded.metadata.get("status"), "done")
+        self.assertIn(
+            "Superseded by 'Verify Restart local cockpit service'.",
+            str(superseded.metadata.get("details") or ""),
+        )
+        self.assertIn(
+            "Ran service action 'restart_local_service' for 'Restart local cockpit service'",
+            cycle.tool_outcome.content,
+        )
+
+    def test_executor_runs_service_inspection_and_completes_task(self) -> None:
+        self.store.record_task(
+            "Restart remote cockpit service",
+            status="blocked",
+            area="execution",
+            details=(
+                "Capture remote reconnect plan.\n"
+                "Latest prep inspection: status=active, active=yes. Verification target: http://old.example/"
+            ),
+            service_action="restart_remote_service",
+            service_label="Restart remote service",
+            service_requires_confirmation=True,
+            blocked_by=["Prepare safer execution for Restart remote cockpit service"],
+            complete_on_success=True,
+        )
+        self.store.record_task(
+            "Prepare safer execution for Restart remote cockpit service",
+            status="open",
+            area="execution",
+            service_inspection="restart_remote_service",
+            service_label="Restart remote service",
+            complete_on_success=True,
+        )
+
+        class FakeServiceManager:
+            def inspect_action(self, action: str) -> dict[str, object]:
+                self.last_action = action
+                return {
+                    "action": action,
+                    "inspection": {"active": False, "status": "inactive"},
+                    "verification_target": "http://100.1.2.3:8766/",
+                    "settings": {},
+                }
+
+        service_manager = FakeServiceManager()
+        executor = MemoryExecutor(self.store, service_manager=service_manager)
+        cycle = executor.execute_next("inspect remote cockpit service", action_limit=3)
+
+        self.assertEqual(service_manager.last_action, "restart_remote_service")
+        self.assertEqual(cycle.result.executed_kind, "run_service_inspection")
+        self.assertEqual(cycle.result.status, "success")
+        self.assertEqual(cycle.result.task_update.metadata.get("status"), "done")
+        self.assertIsNotNone(cycle.result.related_task)
+        self.assertEqual(
+            cycle.result.related_task.metadata.get("title"),
+            "Restart remote cockpit service",
+        )
+        self.assertEqual(cycle.result.related_task.metadata.get("status"), "open")
+        self.assertFalse(cycle.result.related_task.metadata.get("blocked_now"))
+        parent_details = str(cycle.result.related_task.metadata.get("details") or "")
+        self.assertIn("Capture remote reconnect plan.", parent_details)
+        self.assertIn(
+            "Latest prep inspection: status=inactive, active=no. Verification target: http://100.1.2.3:8766/",
+            parent_details,
+        )
+        self.assertNotIn("http://old.example/", parent_details)
+        self.assertEqual(parent_details.count("Latest prep inspection:"), 1)
+        self.assertEqual(
+            cycle.result.metadata.get("service_inspection"),
+            "restart_remote_service",
+        )
+        self.assertIn("Verification target", cycle.result.tool_outcome.content)
+
+    def test_executor_resolves_matching_service_sync_task_after_healthy_verification(self) -> None:
+        self.store.record_task(
+            "Cockpit setup: Install local service",
+            status="open",
+            area="execution",
+            service_action="install_local_service",
+            service_label="Install local service",
+            complete_on_success=True,
+            tags=["cockpit", "service-action", "service-sync"],
+        )
+        self.store.record_task(
+            "Verify Restart local cockpit service",
+            status="open",
+            area="execution",
+            service_inspection="restart_local_service",
+            service_label="Restart local service",
+            complete_on_success=True,
+            tags=["service-verification", "post-action"],
+        )
+
+        class FakeServiceManager:
+            def inspect_action(self, action: str) -> dict[str, object]:
+                self.last_action = action
+                return {
+                    "action": action,
+                    "inspection": {"active": True, "status": "active"},
+                    "verification_target": "http://127.0.0.1:8765/",
+                    "settings": {},
+                }
+
+        service_manager = FakeServiceManager()
+        executor = MemoryExecutor(self.store, service_manager=service_manager)
+        cycle = executor.execute_action(
+            PlannerAction(
+                kind="work_task",
+                title="Verify Restart local cockpit service",
+                summary="Verify the local cockpit service after restart.",
+                score=0.9,
+                metadata={"area": "execution"},
+            )
+        )
+
+        self.assertEqual(cycle.executed_kind, "run_service_inspection")
+        self.assertEqual(cycle.status, "success")
+        self.assertEqual(
+            cycle.metadata.get("resolved_service_sync_titles"),
+            ["Cockpit setup: Install local service"],
+        )
+        resolved_sync = next(
+            task
+            for task in self.store._active_task_memories()
+            if task.subject == "execution"
+            and str(task.metadata.get("title") or "") == "Cockpit setup: Install local service"
+            and str(task.metadata.get("status") or "") == "done"
+        )
+        self.assertEqual(resolved_sync.metadata.get("status"), "done")
+
+    def test_executor_run_maintenance_syncs_recommended_service_tasks(self) -> None:
+        class FakeServiceManager:
+            def settings(self) -> dict[str, object]:
+                return {
+                    "onboarding": {
+                        "actions": [
+                            {
+                                "action": "install_local_service",
+                                "label": "Install local service",
+                                "description": "Install or repair the local cockpit background service.",
+                                "enabled": True,
+                                "success_message": "Local cockpit service installed or repaired.",
+                            }
+                        ]
+                    }
+                }
+
+        executor = MemoryExecutor(self.store, service_manager=FakeServiceManager())
+        result = executor.execute_action(
+            PlannerAction(
+                kind="run_maintenance",
+                title="Run due memory maintenance",
+                summary="Run maintenance.",
+                score=0.5,
+            )
+        )
+
+        self.assertEqual(result.executed_kind, "run_maintenance")
+        self.assertEqual(result.status, "success")
+        self.assertIn("service_sync", result.metadata.get("executed", []))
+        self.assertIn("service_sync", result.maintenance_report.get("executed", {}))
+        synced_task = self.store.find_active_task(
+            "Cockpit setup: Install local service",
+            area="execution",
+        )
+        self.assertIsNotNone(synced_task)
+        self.assertEqual(synced_task.metadata.get("service_action"), "install_local_service")
+
+    def test_linux_pilot_runtime_requires_approval_for_service_action_tasks(self) -> None:
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+
+        self.store.record_task(
+            "Restart local cockpit service",
+            status="open",
+            area="execution",
+            service_action="restart_local_service",
+            service_label="Restart local service",
+            complete_on_success=True,
+        )
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        runtime = LinuxPilotRuntime(self.store, policy=policy)
+
+        report = runtime.run_turn("restart local cockpit service", use_model=False)
+
+        self.assertEqual(report.approval.status, "needs_approval")
+        self.assertEqual(report.approval.category, "service_action")
+        self.assertIn("restart_local_service", report.approval.prompt)
+        self.assertEqual(report.approval.metadata.get("service_label"), "Restart local service")
+        self.assertFalse(report.approval.metadata.get("service_requires_confirmation"))
+        self.assertIsNone(report.execution_result)
+        self.assertIsNone(report.assistant_event_id)
+        self.assertTrue(Path(str(report.trace_path)).exists())
+
+    def test_planner_carries_latest_prep_inspection_on_service_actions(self) -> None:
+        self.store.record_task(
+            "Restart local cockpit service",
+            status="open",
+            area="execution",
+            details=(
+                "Confirm reconnect timing.\n"
+                "Latest prep inspection: status=inactive, active=no. Verification target: http://127.0.0.1:8765/"
+            ),
+            service_action="restart_local_service",
+            service_label="Restart local service",
+            complete_on_success=True,
+        )
+
+        planner = MemoryPlanner(self.store)
+        snapshot = planner.build_plan("restart local cockpit service", action_limit=3)
+
+        self.assertIsNotNone(snapshot.recommendation)
+        self.assertEqual(snapshot.recommendation.kind, "work_task")
+        self.assertEqual(
+            snapshot.recommendation.metadata.get("latest_prep_inspection"),
+            "status=inactive, active=no. Verification target: http://127.0.0.1:8765/",
+        )
+
+    def test_linux_pilot_runtime_approval_uses_latest_prep_inspection_metadata(self) -> None:
+        self.store.record_task(
+            "Restart local cockpit service",
+            status="open",
+            area="execution",
+            service_action="restart_local_service",
+            service_label="Restart local service",
+            complete_on_success=True,
+        )
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        runtime = LinuxPilotRuntime(self.store, policy=policy)
+        task = self.store.find_active_task(
+            "Restart local cockpit service",
+            area="execution",
+            decorate=True,
+        )
+
+        approval = runtime._approval_for_task_record(
+            task,
+            action=PlannerAction(
+                kind="work_task",
+                title="Restart local cockpit service",
+                summary="Work on the service task now.",
+                score=0.9,
+                task_id=task.id if task is not None else None,
+                metadata={
+                    "area": "execution",
+                    "latest_prep_inspection": (
+                        "status=inactive, active=no. Verification target: http://127.0.0.1:8765/"
+                    ),
+                },
+            ),
+            source="test",
+        )
+
+        self.assertEqual(approval.status, "needs_approval")
+        self.assertIn("Latest prep inspection: status=inactive, active=no.", approval.prompt)
+        self.assertEqual(
+            approval.metadata.get("latest_prep_inspection"),
+            "status=inactive, active=no. Verification target: http://127.0.0.1:8765/",
+        )
+
+    def test_linux_pilot_runtime_auto_approves_service_inspection_tasks(self) -> None:
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+        self.store.record_task(
+            "Inspect local cockpit service",
+            status="open",
+            area="execution",
+            service_inspection="restart_local_service",
+            service_label="Restart local service",
+            complete_on_success=True,
+        )
+
+        class FakeServiceManager:
+            def inspect_action(self, action: str) -> dict[str, object]:
+                return {
+                    "action": action,
+                    "inspection": {"active": True, "status": "active"},
+                    "verification_target": "http://127.0.0.1:8765/",
+                    "settings": {},
+                }
+
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        runtime = LinuxPilotRuntime(self.store, policy=policy)
+        runtime.executor.service_manager = FakeServiceManager()
+
+        report = runtime.run_turn("inspect local cockpit service", use_model=False)
+
+        self.assertEqual(report.approval.status, "auto_approved")
+        self.assertEqual(report.approval.category, "service_inspection")
+        self.assertIsNotNone(report.execution_result)
+        self.assertEqual(report.execution_result.executed_kind, "run_service_inspection")
+        self.assertEqual(report.execution_result.status, "success")
+
+    def test_executor_schedules_retry_for_failed_shell_task(self) -> None:
+        self.store.record_task(
+            "Retry CLI help",
+            status="open",
+            area="execution",
+            command="python -m memory_agent.cli --help",
+            retry_limit=2,
+            retry_cooldown_minutes=5,
+        )
+
+        def fake_runner(argv, cwd, capture_output, text, timeout, shell):
+            self.assertEqual(argv[:3], ["python", "-m", "memory_agent.cli"])
+            self.assertFalse(shell)
+            return subprocess.CompletedProcess(argv, 1, "", "boom\n")
+
+        executor = MemoryExecutor(
+            self.store,
+            shell_adapter=GuardedShellAdapter(
+                workspace_root=Path.cwd(),
+                runner=fake_runner,
+            ),
+        )
+        cycle = executor.execute_next("retry cli help", action_limit=3)
+
+        self.assertEqual(cycle.result.executed_kind, "run_shell")
+        self.assertEqual(cycle.result.status, "error")
+        self.assertIn("retry 1/2 was scheduled", cycle.result.summary.lower())
+        self.assertIsNotNone(cycle.result.task_update)
+        self.assertEqual(cycle.result.task_update.metadata.get("status"), "open")
+        self.assertEqual(cycle.result.task_update.metadata.get("retry_count"), 1)
+        self.assertEqual(cycle.result.task_update.metadata.get("retry_limit"), 2)
+        self.assertEqual(cycle.result.task_update.metadata.get("retry_cooldown_minutes"), 5)
+        self.assertTrue(cycle.result.task_update.metadata.get("snoozed_until"))
+
+    def test_planner_surfaces_retry_ready_reason_after_cooldown(self) -> None:
+        self.store.record_task(
+            "Retry ready task",
+            status="open",
+            area="execution",
+            command="python -m memory_agent.cli --help",
+            retry_limit=2,
+            retry_count=1,
+            retry_cooldown_minutes=0,
+            last_retry_at="2026-03-29T00:00:00+00:00",
+            last_failure_at="2026-03-29T00:00:00+00:00",
+        )
+
+        planner = MemoryPlanner(self.store)
+        snapshot = planner.build_plan("what should I do next", action_limit=3)
+
+        self.assertIsNotNone(snapshot.recommendation)
+        self.assertEqual(snapshot.recommendation.title, "Retry ready task")
+        self.assertIn("retry_ready=1/2", snapshot.recommendation.reasons)
 
     def test_linux_pilot_runtime_requires_approval_for_file_write_tasks(self) -> None:
         target = self.temp_root / f"{uuid.uuid4().hex}_pilot_write.txt"
@@ -1049,6 +1875,11 @@ class MemoryStoreTests(unittest.TestCase):
         policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
         policy.trusted_auto_approve_file_operations = {"append_text"}
         policy.trusted_auto_approve_required_successes = 4
+        policy.service_sync_suppression_window_seconds = {
+            "local_service": 300,
+            "remote_service": 2400,
+            "desktop_launcher": 900,
+        }
         policy_path = self.temp_root / f"{uuid.uuid4().hex}_pilot_policy.toml"
         self.extra_paths.append(policy_path)
         policy_path.write_text(policy.render_template(), encoding="utf-8")
@@ -1057,6 +1888,14 @@ class MemoryStoreTests(unittest.TestCase):
 
         self.assertEqual(loaded.trusted_auto_approve_file_operations, {"append_text"})
         self.assertEqual(loaded.trusted_auto_approve_required_successes, 4)
+        self.assertEqual(
+            loaded.service_sync_suppression_window_seconds,
+            {
+                "local_service": 300,
+                "remote_service": 2400,
+                "desktop_launcher": 900,
+            },
+        )
 
     def test_linux_pilot_runtime_can_approve_pending_turn_without_duplicate_user_event(self) -> None:
         target = self.temp_root / f"{uuid.uuid4().hex}_pilot_pending.txt"
@@ -1269,6 +2108,48 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(
             report.after_plan.recommendation.title,
             "Prepare safer execution for Pilot runtime risky write",
+        )
+
+    def test_linux_pilot_runtime_auto_executes_preparation_for_confirmation_heavy_service_task(self) -> None:
+        trace_dir = self.temp_root / f"pilot_traces_{uuid.uuid4().hex}"
+        self.extra_dirs.append(trace_dir)
+        self.store.record_task(
+            "Restart remote cockpit service",
+            status="open",
+            area="execution",
+            service_action="restart_remote_service",
+            service_label="Restart remote service",
+            service_requires_confirmation=True,
+            service_confirmation_message=(
+                "Restart remote access for this machine? Existing remote browser sessions may need to reconnect afterward."
+            ),
+            complete_on_success=True,
+        )
+        policy = LinuxPilotPolicy.default(workspace_root=Path.cwd())
+        policy.trace_dir = trace_dir
+        runtime = LinuxPilotRuntime(self.store, policy=policy)
+
+        report = runtime.run_turn("what should I do next", use_model=False)
+
+        self.assertIsNotNone(report.selected_action)
+        self.assertEqual(report.selected_action.kind, "prepare_task")
+        self.assertEqual(report.approval.status, "auto_approved")
+        self.assertIsNotNone(report.execution_result)
+        self.assertEqual(report.execution_result.executed_kind, "prepare_task")
+        self.assertEqual(report.execution_result.status, "success")
+        self.assertEqual(
+            report.execution_result.related_task.metadata.get("title"),
+            "Prepare safer execution for Restart remote cockpit service",
+        )
+        prep_details = str(report.execution_result.related_task.metadata.get("details") or "")
+        self.assertIn("1. Inspect current service state", prep_details)
+        self.assertIn("3. Define the post-action verification", prep_details)
+        self.assertEqual(
+            report.execution_result.related_task.metadata.get("service_inspection"),
+            "restart_remote_service",
+        )
+        self.assertTrue(
+            report.execution_result.related_task.metadata.get("complete_on_success")
         )
 
     def test_pilot_run_review_flags_approval_friction_and_promotes_task(self) -> None:
@@ -2069,7 +2950,7 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(cycle.result.file_result.reason, "path_outside_workspace")
         self.assertIn("blocked by file policy", cycle.result.summary.lower())
 
-    def test_improvement_review_records_evaluation_and_promotes_code_patching_backlog(self) -> None:
+    def test_improvement_review_records_evaluation_and_promotes_current_strategic_backlog(self) -> None:
         class FakeEvaluator:
             def run_builtin_suite(self):
                 return EvalSuiteResult(
@@ -2101,19 +2982,19 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertIsNotNone(self.store.latest_evaluation_run())
         self.assertTrue(
             any(
-                opportunity.title == "Add code-aware patching primitives"
+                opportunity.title == "Add richer task orchestration"
                 for opportunity in review.opportunities
             )
         )
         self.assertTrue(
             any(
-                str(task.metadata.get("title")) == "Add code-aware patching primitives"
+                str(task.metadata.get("title")) == "Add richer task orchestration"
                 for task in review.promoted_tasks
             )
         )
         self.assertIsNotNone(
             self.store.find_active_task(
-                "Add code-aware patching primitives",
+                "Add richer task orchestration",
                 area="self_improvement",
             )
         )
@@ -3233,16 +4114,28 @@ class MemoryStoreTests(unittest.TestCase):
                     model="fake-main",
                 )
 
-        agent = MemoryFirstAgent(self.store, model_adapter=FakeModelAdapter())
-        report = agent.respond("What should I do next?")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            soul_path = Path(tmpdir) / "SOUL.md"
+            soul_path.write_text(
+                "# Test Soul\n\n- Teach gently.\n- Protect operator trust.\n",
+                encoding="utf-8",
+            )
+            agent = MemoryFirstAgent(
+                self.store,
+                model_adapter=FakeModelAdapter(),
+                workspace_root=Path(tmpdir),
+            )
+            report = agent.respond("What should I do next?")
 
-        self.assertIsNone(report.error)
-        self.assertEqual(report.assistant_message, "We should clear the blocker on Build task graph maintenance first.")
-        self.assertIsNotNone(report.assistant_event_id)
-        self.assertEqual(len(captured_messages), 2)
-        self.assertEqual(captured_messages[0].role, "system")
-        self.assertIn("Build task graph maintenance", captured_messages[0].content)
-        self.assertIn("Planner state:", captured_messages[0].content)
+            self.assertIsNone(report.error)
+            self.assertEqual(report.assistant_message, "We should clear the blocker on Build task graph maintenance first.")
+            self.assertIsNotNone(report.assistant_event_id)
+            self.assertEqual(len(captured_messages), 2)
+            self.assertEqual(captured_messages[0].role, "system")
+            self.assertIn("Build task graph maintenance", captured_messages[0].content)
+            self.assertIn("Planner state:", captured_messages[0].content)
+            self.assertIn("Ernie SOUL:", captured_messages[0].content)
+            self.assertIn("Teach gently.", captured_messages[0].content)
         events = self.store.recent_events(limit=2)
         self.assertEqual(events[-1].role, "assistant")
         self.assertIn("clear the blocker", events[-1].content.lower())
@@ -3254,6 +4147,7 @@ class MemoryStoreTests(unittest.TestCase):
             area="execution",
             due_date="2000-01-01",
         )
+        captured_messages = []
 
         class FakeModelAdapter:
             @property
@@ -3268,6 +4162,7 @@ class MemoryStoreTests(unittest.TestCase):
                 }
 
             def chat(self, messages):
+                captured_messages.extend(messages)
                 return ModelResponse(
                     content=(
                         '{"assistant_message":"I am starting the overdue ready task now.",'
@@ -3277,20 +4172,33 @@ class MemoryStoreTests(unittest.TestCase):
                     model="fake-main",
                 )
 
-        agent = MemoryFirstAgent(self.store, model_adapter=FakeModelAdapter())
-        report = agent.decide("What should I do next?")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            soul_path = Path(tmpdir) / "SOUL.md"
+            soul_path.write_text(
+                "# Test Soul\n\n- Prefer bounded progress.\n- Say what is unknown.\n",
+                encoding="utf-8",
+            )
+            agent = MemoryFirstAgent(
+                self.store,
+                model_adapter=FakeModelAdapter(),
+                workspace_root=Path(tmpdir),
+            )
+            report = agent.decide("What should I do next?")
 
-        self.assertIsNone(report.error)
-        self.assertIsNotNone(report.model_action)
-        self.assertEqual(report.model_action.action_type, "execute_plan_action")
-        self.assertIsNotNone(report.model_action.chosen_option)
-        self.assertEqual(report.model_action.chosen_option.option_id, "A1")
-        self.assertIsNotNone(report.execution_result)
-        self.assertEqual(report.execution_result.executed_kind, "work_task")
-        self.assertEqual(report.execution_result.status, "success")
-        self.assertEqual(report.execution_result.task_update.metadata.get("status"), "in_progress")
-        self.assertEqual(report.assistant_message, "I am starting the overdue ready task now.")
-        self.assertIsNotNone(report.after_plan)
+            self.assertIsNone(report.error)
+            self.assertIsNotNone(report.model_action)
+            self.assertEqual(report.model_action.action_type, "execute_plan_action")
+            self.assertIsNotNone(report.model_action.chosen_option)
+            self.assertEqual(report.model_action.chosen_option.option_id, "A1")
+            self.assertIsNotNone(report.execution_result)
+            self.assertEqual(report.execution_result.executed_kind, "work_task")
+            self.assertEqual(report.execution_result.status, "success")
+            self.assertEqual(report.execution_result.task_update.metadata.get("status"), "in_progress")
+            self.assertEqual(report.assistant_message, "I am starting the overdue ready task now.")
+            self.assertIsNotNone(report.after_plan)
+            self.assertEqual(len(captured_messages), 2)
+            self.assertIn("Ernie SOUL:", captured_messages[0].content)
+            self.assertIn("Prefer bounded progress.", captured_messages[0].content)
         events = self.store.recent_events(limit=2)
         self.assertEqual(events[-1].role, "assistant")
         self.assertIn("starting the overdue ready task", events[-1].content.lower())
@@ -3341,6 +4249,118 @@ class MemoryStoreTests(unittest.TestCase):
         events = self.store.recent_events(limit=2)
         self.assertEqual(events[-1].role, "assistant")
         self.assertIn("status update instead", events[-1].content.lower())
+
+    def test_agent_explain_plan_uses_model_with_planner_context(self) -> None:
+        self.store.record_task(
+            "Explain current recommendation",
+            status="open",
+            area="execution",
+            due_date="2000-01-01",
+        )
+        captured_messages = []
+
+        class FakeModelAdapter:
+            @property
+            def enabled(self):
+                return True
+
+            def status(self):
+                return {
+                    "enabled": True,
+                    "backend": "fake",
+                    "model": "fake-main",
+                }
+
+            def chat(self, messages):
+                captured_messages.extend(messages)
+                return ModelResponse(
+                    content="This is next because it is the most bounded overdue step and there is still a safe alternative if you want a different path.",
+                    model="fake-main",
+                )
+
+        agent = MemoryFirstAgent(self.store, model_adapter=FakeModelAdapter())
+        report = agent.explain_plan("What should I do next?")
+
+        self.assertTrue(report.used_model)
+        self.assertIn("bounded overdue step", report.text)
+        self.assertEqual(len(captured_messages), 2)
+        self.assertIn("Explain the current planner recommendation", captured_messages[0].content)
+        self.assertIn("Planner state:", captured_messages[0].content)
+
+    def test_agent_narrate_execution_uses_model_with_execution_result(self) -> None:
+        self.store.record_task(
+            "Narrate the executed step",
+            status="open",
+            area="execution",
+            due_date="2000-01-01",
+        )
+        captured_messages = []
+
+        class FakeModelAdapter:
+            @property
+            def enabled(self):
+                return True
+
+            def status(self):
+                return {
+                    "enabled": True,
+                    "backend": "fake",
+                    "model": "fake-main",
+                }
+
+            def chat(self, messages):
+                captured_messages.extend(messages)
+                return ModelResponse(
+                    content="The step moved the task into active work and the next bounded recommendation is to inspect the refreshed queue.",
+                    model="fake-main",
+                )
+
+        agent = MemoryFirstAgent(self.store, model_adapter=FakeModelAdapter())
+        cycle = agent.execute_next("Narrate the executed step", action_limit=3)
+        report = agent.narrate_execution(
+            query="Narrate the executed step",
+            before_plan=cycle.before_plan,
+            result=cycle.result,
+            after_plan=cycle.after_plan,
+        )
+
+        self.assertTrue(report.used_model)
+        self.assertIn("next bounded recommendation", report.text)
+        self.assertEqual(len(captured_messages), 2)
+        self.assertIn("Summarize what changed after a bounded execution step", captured_messages[0].content)
+        self.assertIn("Execution result:", captured_messages[0].content)
+
+    def test_agent_prompt_workshop_uses_model_without_storing_events(self) -> None:
+        baseline_events = self.store.stats()["events"]
+        captured_messages = []
+
+        class FakeModelAdapter:
+            @property
+            def enabled(self):
+                return True
+
+            def status(self):
+                return {
+                    "enabled": True,
+                    "backend": "fake",
+                    "model": "fake-main",
+                }
+
+            def chat(self, messages):
+                captured_messages.extend(messages)
+                return ModelResponse(
+                    content="Rewrite the prompt so it names the goal, the constraints, and the desired output in one bounded request.",
+                    model="fake-main",
+                )
+
+        agent = MemoryFirstAgent(self.store, model_adapter=FakeModelAdapter())
+        report = agent.workshop_prompt("help me make this better", mode="clarify")
+
+        self.assertTrue(report.used_model)
+        self.assertIn("names the goal", report.text)
+        self.assertEqual(self.store.stats()["events"], baseline_events)
+        self.assertEqual(len(captured_messages), 2)
+        self.assertIn("quarantined text", captured_messages[0].content)
 
     def test_ollama_chat_adapter_parses_response_payload(self) -> None:
         payloads = []
@@ -3490,6 +4510,74 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertIn("maintenance", stats)
         self.assertFalse(stats["maintenance"]["reflection"]["due"])
 
+    def test_sync_service_tasks_creates_dedupes_and_resolves_recommended_actions(self) -> None:
+        initial = self.store.sync_service_tasks(
+            {
+                "onboarding": {
+                    "actions": [
+                        {
+                            "action": "install_remote_service",
+                            "label": "Install remote service",
+                            "description": "Install or repair the managed remote cockpit service.",
+                            "enabled": True,
+                            "requires_confirmation": True,
+                            "confirmation_message": "Install or repair remote access for this machine?",
+                            "success_message": "Managed remote service installed or repaired.",
+                        }
+                    ]
+                }
+            }
+        )
+
+        self.assertEqual(initial["recommended_actions"], ["install_remote_service"])
+        self.assertEqual(len(initial["created"]), 1)
+        synced_task = self.store.find_active_task(
+            "Cockpit setup: Install remote service",
+            area="execution",
+        )
+        self.assertIsNotNone(synced_task)
+        self.assertEqual(synced_task.metadata.get("service_action"), "install_remote_service")
+        self.assertEqual(synced_task.metadata.get("service_label"), "Install remote service")
+        self.assertTrue(synced_task.metadata.get("service_requires_confirmation"))
+        self.assertIn(
+            "Install or repair remote access for this machine?",
+            str(synced_task.metadata.get("service_confirmation_message") or ""),
+        )
+        self.assertIn("service-sync", synced_task.tags)
+
+        repeated = self.store.sync_service_tasks(
+            {
+                "onboarding": {
+                    "actions": [
+                        {
+                            "action": "install_remote_service",
+                            "label": "Install remote service",
+                            "description": "Install or repair the managed remote cockpit service.",
+                            "enabled": True,
+                            "requires_confirmation": True,
+                            "confirmation_message": "Install or repair remote access for this machine?",
+                            "success_message": "Managed remote service installed or repaired.",
+                        }
+                    ]
+                }
+            }
+        )
+
+        self.assertFalse(repeated["created"])
+        self.assertEqual(len(repeated["unchanged"]), 1)
+        reviewable_titles = [
+            str(task.metadata.get("title"))
+            for task in self.store.get_open_tasks(limit=10)
+        ]
+        self.assertEqual(reviewable_titles.count("Cockpit setup: Install remote service"), 1)
+
+        resolved = self.store.sync_service_tasks({"onboarding": {"actions": []}})
+
+        self.assertEqual(len(resolved["resolved"]), 1)
+        latest = self.store._find_active_task_any_area("Cockpit setup: Install remote service")
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.metadata.get("status"), "done")
+
     def test_optional_semantic_reranker_can_reorder_candidates(self) -> None:
         self.store.remember(
             MemoryDraft(
@@ -3592,6 +4680,212 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(context["query"], "cockpit")
         self.assertIn("ready_tasks", context)
 
+    def test_cockpit_service_execute_plan_action_includes_model_explanation(self) -> None:
+        self.store.record_task(
+            "Ship local cockpit",
+            status="open",
+            area="execution",
+            due_date="2000-01-01",
+        )
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+
+        class FakeModelAdapter:
+            @property
+            def enabled(self):
+                return True
+
+            def status(self):
+                return {
+                    "enabled": True,
+                    "backend": "fake",
+                    "model": "fake-main",
+                }
+
+            def chat(self, messages):
+                return ModelResponse(
+                    content="The step ran, updated the task state, and left a refreshed bounded recommendation behind it.",
+                    model="fake-main",
+                )
+
+        service.agent.model_adapter = FakeModelAdapter()
+        payload = service.execute_plan_action(
+            query="ship local cockpit",
+            kind="work_task",
+            title="Ship local cockpit",
+            limit=3,
+        )
+
+        self.assertIn("model_explanation", payload)
+        self.assertTrue(payload["model_explanation"]["used_model"])
+        self.assertIn("refreshed bounded recommendation", payload["model_explanation"]["text"])
+
+    def test_cockpit_service_prompt_workshop_is_quarantined(self) -> None:
+        baseline_events = self.store.stats()["events"]
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+
+        class FakeModelAdapter:
+            @property
+            def enabled(self):
+                return True
+
+            def status(self):
+                return {
+                    "enabled": True,
+                    "backend": "fake",
+                    "model": "fake-main",
+                }
+
+            def chat(self, messages):
+                return ModelResponse(
+                    content="Draft workshop result: tighten the prompt and separate execution from exploration.",
+                    model="fake-main",
+                )
+
+        service.agent.model_adapter = FakeModelAdapter()
+        payload = service.prompt_workshop(
+            draft="help me tighten this prompt",
+            mode="improve",
+        )
+
+        self.assertTrue(payload["used_model"])
+        self.assertIn("Draft workshop result", payload["text"])
+        self.assertEqual(self.store.stats()["events"], baseline_events)
+
+    def test_cockpit_service_prompt_promotion_records_live_input(self) -> None:
+        baseline_events = self.store.stats()["events"]
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+
+        payload = service.promote_prompt_text(
+            text="Use a calm tone and keep the answer bounded.",
+            source="result",
+        )
+
+        self.assertEqual(payload["prompt_source"], "result")
+        self.assertEqual(self.store.stats()["events"], baseline_events + 1)
+        self.assertIsNotNone(payload["plan"])
+        latest_activity = self.store.get_recent_tool_outcomes(limit=1)[0]
+        self.assertEqual(latest_activity.metadata.get("tool_name"), "prompt-promote")
+        self.assertEqual(latest_activity.metadata.get("prompt_source"), "result")
+
+    def test_cockpit_service_send_prompt_to_pilot_queues_guided_review(self) -> None:
+        workspace = self._make_workspace()
+        target = workspace / "pilot_workshop.txt"
+        target.write_text("alpha\nbeta\n", encoding="utf-8")
+        self.store.record_task(
+            "Pilot workshop write",
+            status="open",
+            area="execution",
+            file_operation="replace_text",
+            file_path=str(target.relative_to(workspace)),
+            find_text="beta",
+            file_text="gamma",
+            complete_on_success=True,
+        )
+        baseline_events = self.store.stats()["events"]
+        service = CockpitService(self.store, workspace_root=workspace)
+
+        payload = service.send_prompt_to_pilot(
+            text="pilot workshop write",
+            source="result",
+            action_limit=3,
+            use_model=False,
+        )
+
+        self.assertEqual(payload["prompt_source"], "result")
+        self.assertEqual(payload["request_origin"], "prompt_workshop")
+        self.assertEqual(payload["approval"]["status"], "needs_approval")
+        self.assertIsNotNone(payload["pending_id"])
+        queue = service.pending_pilot_queue()
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["request_origin"], "prompt_workshop")
+        self.assertEqual(queue[0]["prompt_source"], "result")
+        self.assertEqual(self.store.stats()["events"], baseline_events + 1)
+        latest_activity = self.store.get_recent_tool_outcomes(limit=1)[0]
+        self.assertEqual(latest_activity.metadata.get("tool_name"), "prompt-pilot-bridge")
+        self.assertEqual(latest_activity.metadata.get("prompt_source"), "result")
+
+    def test_cockpit_service_approve_workshop_prompt_pilot_records_execution_trail(self) -> None:
+        workspace = self._make_workspace()
+        target = workspace / "pilot_workshop_approve.txt"
+        target.write_text("alpha\nbeta\n", encoding="utf-8")
+        self.store.record_task(
+            "Pilot workshop approve write",
+            status="open",
+            area="execution",
+            file_operation="replace_text",
+            file_path=str(target.relative_to(workspace)),
+            find_text="beta",
+            file_text="gamma",
+            complete_on_success=True,
+        )
+        service = CockpitService(self.store, workspace_root=workspace)
+
+        preview = service.send_prompt_to_pilot(
+            text="pilot workshop approve write",
+            source="draft",
+            action_limit=3,
+            use_model=False,
+        )
+        approved = service.approve_pilot_turn(pending_id=preview["pending_id"])
+
+        self.assertEqual(approved["request_origin"], "prompt_workshop")
+        self.assertEqual(approved["prompt_source"], "draft")
+        self.assertIsNotNone(approved["execution_result"])
+        latest_activity = self.store.get_recent_tool_outcomes(limit=1)[0]
+        self.assertEqual(latest_activity.metadata.get("tool_name"), "prompt-pilot-execution")
+        self.assertEqual(latest_activity.metadata.get("prompt_source"), "draft")
+        self.assertEqual(latest_activity.metadata.get("request_origin"), "prompt_workshop")
+        self.assertEqual(
+            latest_activity.metadata.get("execution_status"),
+            approved["execution_result"]["status"],
+        )
+        self.assertTrue(
+            str(latest_activity.metadata.get("rejection_reason") or "").startswith("validation_failed:")
+        )
+        self.assertEqual(
+            latest_activity.metadata.get("selected_action_title"),
+            approved["selected_action"]["title"],
+        )
+        self.assertIn("Prompt Workshop draft", latest_activity.metadata.get("outcome") or "")
+
+    def test_cockpit_html_includes_operator_tutorial_copy(self) -> None:
+        self.assertIn("Prepare = preflight", COCKPIT_HTML)
+        self.assertIn("Trusted writes only cover repeated low-risk single-file edits", COCKPIT_HTML)
+        self.assertIn("Prepare = safer preflight. Delegate = tracked handoff.", COCKPIT_HTML)
+        self.assertIn("First Run Tutorial", COCKPIT_HTML)
+        self.assertIn("Use bounded steps for your first hands-on test", COCKPIT_HTML)
+        self.assertIn("Safe stopping rule", COCKPIT_HTML)
+        self.assertIn("Recent demo walkthrough", COCKPIT_HTML)
+        self.assertIn("How Ernie Operates", COCKPIT_HTML)
+        self.assertIn("Review soul", COCKPIT_HTML)
+        self.assertIn("Governed identity loop", COCKPIT_HTML)
+        self.assertIn("Dismiss for now", COCKPIT_HTML)
+        self.assertIn("Soul audit trail", COCKPIT_HTML)
+        self.assertIn("Why now:", COCKPIT_HTML)
+        self.assertIn("Target section:", COCKPIT_HTML)
+        self.assertIn("Use result as draft", COCKPIT_HTML)
+        self.assertIn("Undo local edit", COCKPIT_HTML)
+        self.assertIn("Replace selection", COCKPIT_HTML)
+        self.assertIn("Append result", COCKPIT_HTML)
+        self.assertIn("Promote result to live note", COCKPIT_HTML)
+        self.assertIn("Send result to guided loop", COCKPIT_HTML)
+        self.assertIn("Send draft to guided loop", COCKPIT_HTML)
+        self.assertIn("Prompt Workshop result", COCKPIT_HTML)
+        self.assertIn("Manual pilot request", COCKPIT_HTML)
+        self.assertIn("Request origin", COCKPIT_HTML)
+        self.assertIn("prompt workshop chain", COCKPIT_HTML)
+        self.assertIn("entered the guided loop", COCKPIT_HTML)
+        self.assertIn("A pilot review packet was queued for approval.", COCKPIT_HTML)
+        self.assertIn("rejected by validation before apply", COCKPIT_HTML)
+        self.assertIn("Workshop mode", COCKPIT_HTML)
+        self.assertIn("Promotion boundary", COCKPIT_HTML)
+        self.assertIn("Draft editing helpers", COCKPIT_HTML)
+        self.assertIn("Local history buffer", COCKPIT_HTML)
+        self.assertIn("Local prompt history", COCKPIT_HTML)
+        self.assertIn("Restore this draft", COCKPIT_HTML)
+        self.assertIn("Draft before workshop", COCKPIT_HTML)
+        self.assertIn("Workshop result after rewrite", COCKPIT_HTML)
+
     def test_cockpit_service_observe_and_execute_next(self) -> None:
         self.store.record_task(
             "Ship local cockpit",
@@ -3613,6 +4907,60 @@ class MemoryStoreTests(unittest.TestCase):
         active = self.store.find_active_task("Ship local cockpit", area="execution")
         self.assertIsNotNone(active)
         self.assertEqual(active.metadata.get("status"), "in_progress")
+
+    def test_cockpit_service_execute_plan_action_runs_selected_recommendation(self) -> None:
+        self.store.record_task(
+            "Ship guided cockpit loop",
+            status="open",
+            area="execution",
+        )
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+
+        snapshot = service.snapshot(query="ship guided cockpit loop", limit=3)
+        recommendation = snapshot["plan"]["recommendation"]
+        executed = service.execute_plan_action(
+            query="ship guided cockpit loop",
+            kind=recommendation["kind"],
+            title=recommendation["title"],
+            task_id=recommendation.get("task_id"),
+            limit=3,
+        )
+
+        self.assertEqual(executed["selection_source"], "explicit_plan_action")
+        self.assertEqual(executed["selected_action"]["title"], "Ship guided cockpit loop")
+        self.assertEqual(executed["result"]["status"], "success")
+        self.assertEqual(executed["result"]["executed_kind"], "work_task")
+
+    def test_cockpit_service_execute_plan_action_can_run_alternative(self) -> None:
+        self.store.record_task(
+            "Ship guided cockpit loop",
+            status="open",
+            area="execution",
+        )
+        self.store.record_task(
+            "Document cockpit tutorial basics",
+            status="open",
+            area="execution",
+        )
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+
+        snapshot = service.snapshot(query="what should I do next", limit=5)
+        alternatives = snapshot["plan"]["alternatives"]
+
+        self.assertTrue(alternatives)
+        selected = alternatives[0]
+        executed = service.execute_plan_action(
+            query="what should I do next",
+            kind=selected["kind"],
+            title=selected["title"],
+            task_id=selected.get("task_id"),
+            limit=5,
+        )
+
+        self.assertEqual(executed["selection_source"], "explicit_plan_action")
+        self.assertEqual(executed["selected_action"]["title"], selected["title"])
+        self.assertEqual(executed["result"]["status"], "success")
+        self.assertEqual(executed["result"]["executed_kind"], selected["kind"])
 
     def test_cockpit_health_payload_reports_service_state(self) -> None:
         service = CockpitService(self.store, workspace_root=Path.cwd())
@@ -3644,7 +4992,35 @@ class MemoryStoreTests(unittest.TestCase):
 
         self.assertEqual(detail["task"]["id"], task.id)
         self.assertEqual(detail["task"]["metadata"]["due_date"], "2026-04-11")
+        self.assertTrue(
+            any(
+                item["kind"] in {"work_task", "resolve_blocker"}
+                for item in detail["task_plan_actions"]
+            )
+        )
         self.assertEqual(runs[0]["run_name"], "cockpit patch demo")
+
+    def test_cockpit_service_task_detail_surfaces_prepare_action_for_confirmation_heavy_task(self) -> None:
+        self.store.record_task(
+            "Restart remote cockpit service",
+            status="open",
+            area="execution",
+            service_action="restart_remote_service",
+            service_label="Restart remote service",
+            service_requires_confirmation=True,
+            service_confirmation_message="Restart remote access for this machine?",
+            complete_on_success=True,
+        )
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+
+        detail = service.task_detail(
+            title="Restart remote cockpit service",
+            area="execution",
+        )
+
+        self.assertTrue(
+            any(item["kind"] == "prepare_task" for item in detail["task_plan_actions"])
+        )
 
     def test_cockpit_service_preview_and_reject_pilot_turn(self) -> None:
         workspace = self._make_workspace()
@@ -3703,6 +5079,193 @@ class MemoryStoreTests(unittest.TestCase):
             area="execution",
         )
         self.assertEqual(completed["completed"]["metadata"]["status"], "done")
+
+    def test_cockpit_service_seed_demo_workflow_creates_visible_tasks(self) -> None:
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+
+        seeded = service.seed_demo_workflow()
+
+        self.assertEqual(
+            seeded["created_titles"],
+            ["Try cockpit guided loop", "Inspect local cockpit service status"],
+        )
+        self.assertIn("Try cockpit guided loop", seeded["open_tasks"])
+        self.assertIn("Inspect local cockpit service status", seeded["open_tasks"])
+        inspection_task = self.store.find_active_task(
+            "Inspect local cockpit service status",
+            area="execution",
+        )
+        self.assertIsNotNone(inspection_task)
+        self.assertEqual(
+            inspection_task.metadata.get("service_inspection"),
+            "restart_local_service",
+        )
+        latest_demo_activity = self.store.get_recent_tool_outcomes(limit=1)[0]
+        self.assertEqual(latest_demo_activity.metadata.get("tool_name"), "demo-workflow")
+        self.assertEqual(latest_demo_activity.metadata.get("demo_event"), "seed")
+
+    def test_cockpit_service_seed_demo_workflow_is_idempotent(self) -> None:
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+
+        first = service.seed_demo_workflow()
+        second = service.seed_demo_workflow()
+
+        self.assertEqual(
+            first["created_titles"],
+            ["Try cockpit guided loop", "Inspect local cockpit service status"],
+        )
+        self.assertEqual(second["created_titles"], [])
+        self.assertEqual(
+            second["unchanged_titles"],
+            ["Try cockpit guided loop", "Inspect local cockpit service status"],
+        )
+
+    def test_cockpit_service_reset_demo_workflow_restores_starting_state(self) -> None:
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+        service.seed_demo_workflow()
+        self.store.record_task(
+            "Try cockpit guided loop",
+            status="in_progress",
+            area="execution",
+        )
+        self.store.record_task(
+            "Inspect local cockpit service status",
+            status="done",
+            area="execution",
+        )
+
+        reset = service.reset_demo_workflow()
+
+        self.assertEqual(
+            reset["reset_titles"],
+            ["Try cockpit guided loop", "Inspect local cockpit service status"],
+        )
+        guided = self.store.find_active_task("Try cockpit guided loop", area="execution")
+        inspection = self.store.find_active_task(
+            "Inspect local cockpit service status",
+            area="execution",
+        )
+        self.assertIsNotNone(guided)
+        self.assertIsNotNone(inspection)
+        self.assertEqual(guided.metadata.get("status"), "open")
+        self.assertEqual(inspection.metadata.get("status"), "open")
+        self.assertEqual(
+            inspection.metadata.get("service_inspection"),
+            "restart_local_service",
+        )
+        latest_demo_activity = self.store.get_recent_tool_outcomes(limit=1)[0]
+        self.assertEqual(latest_demo_activity.metadata.get("tool_name"), "demo-workflow")
+        self.assertEqual(latest_demo_activity.metadata.get("demo_event"), "reset")
+
+    def test_cockpit_service_execute_plan_action_records_demo_run_activity(self) -> None:
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+        service.seed_demo_workflow()
+
+        payload = service.execute_plan_action(
+            query="try cockpit guided loop",
+            kind="work_task",
+            title="Try cockpit guided loop",
+            limit=3,
+        )
+
+        self.assertEqual(payload["selected_action"]["title"], "Try cockpit guided loop")
+        latest_demo_activity = self.store.get_recent_tool_outcomes(limit=1)[0]
+        self.assertEqual(latest_demo_activity.metadata.get("tool_name"), "demo-workflow")
+        self.assertEqual(latest_demo_activity.metadata.get("demo_event"), "run")
+        self.assertEqual(
+            latest_demo_activity.metadata.get("plan_action_kind"),
+            "work_task",
+        )
+        self.assertEqual(
+            latest_demo_activity.metadata.get("execution_status"),
+            "success",
+        )
+
+    def test_cockpit_service_soul_review_and_apply_proposal(self) -> None:
+        workspace = self._make_workspace()
+        service = CockpitService(self.store, workspace_root=workspace)
+        self.store.observe(
+            role="user",
+            content="I am inexperienced and I will need tutorials on things.",
+        )
+        self.store.observe(
+            role="user",
+            content="Keep going while I sleep and stop at real approval boundaries.",
+        )
+
+        review = service.soul_review()
+
+        proposal_ids = [item["proposal_id"] for item in review["proposals"]]
+        self.assertIn("operator_tutorial_duty", proposal_ids)
+        applied = service.apply_soul_amendment(proposal_id="operator_tutorial_duty")
+
+        soul_path = workspace / "SOUL.md"
+        self.assertTrue(soul_path.exists())
+        soul_text = soul_path.read_text(encoding="utf-8")
+        self.assertIn(
+            "When introducing a new workflow, pair it with a short hands-on tutorial",
+            soul_text,
+        )
+        remaining_ids = [item["proposal_id"] for item in applied["review"]["proposals"]]
+        self.assertNotIn("operator_tutorial_duty", remaining_ids)
+        self.assertIn("autonomous_chunking_rule", remaining_ids)
+
+    def test_cockpit_service_soul_dismiss_suppresses_proposal_and_records_audit(self) -> None:
+        workspace = self._make_workspace()
+        service = CockpitService(self.store, workspace_root=workspace)
+        self.store.observe(
+            role="user",
+            content="I am inexperienced and I will need tutorials on things.",
+        )
+
+        review = service.soul_review()
+        proposal_ids = [item["proposal_id"] for item in review["proposals"]]
+        self.assertIn("operator_tutorial_duty", proposal_ids)
+
+        dismissed = service.dismiss_soul_amendment(proposal_id="operator_tutorial_duty")
+
+        remaining_ids = [item["proposal_id"] for item in dismissed["review"]["proposals"]]
+        self.assertNotIn("operator_tutorial_duty", remaining_ids)
+        audit = service.settings()["soul_audit"]
+        self.assertTrue(audit)
+        self.assertEqual(audit[0]["tool_name"], "soul-dismiss")
+        self.assertEqual(audit[0]["proposal_id"], "operator_tutorial_duty")
+
+    def test_cockpit_service_soul_dismissal_reappears_when_evidence_changes(self) -> None:
+        workspace = self._make_workspace()
+        service = CockpitService(self.store, workspace_root=workspace)
+        self.store.observe(
+            role="user",
+            content="I am inexperienced and I will need tutorials on things.",
+        )
+
+        initial_review = service.soul_review()
+        initial_proposal = next(
+            item for item in initial_review["proposals"]
+            if item["proposal_id"] == "operator_tutorial_duty"
+        )
+        service.dismiss_soul_amendment(proposal_id="operator_tutorial_duty")
+
+        suppressed_review = service.soul_review()
+        suppressed_ids = [item["proposal_id"] for item in suppressed_review["proposals"]]
+        self.assertNotIn("operator_tutorial_duty", suppressed_ids)
+
+        self.store.observe(
+            role="user",
+            content="Please add beginner tutorials and a hands-on learning walkthrough for new workflows.",
+        )
+
+        renewed_review = service.soul_review()
+        renewed_proposal = next(
+            item for item in renewed_review["proposals"]
+            if item["proposal_id"] == "operator_tutorial_duty"
+        )
+        self.assertNotEqual(
+            initial_proposal["evidence_signature"],
+            renewed_proposal["evidence_signature"],
+        )
+        self.assertTrue(renewed_proposal["resurfaced_after_dismissal"])
+        self.assertIn("tutorials", renewed_proposal["explanation"].lower())
 
     def test_cockpit_service_settings_and_remote_token_rotation(self) -> None:
         config_dir = self.temp_root / f"remote_cfg_{uuid.uuid4().hex}"
@@ -3789,6 +5352,9 @@ class MemoryStoreTests(unittest.TestCase):
             settings = service.settings()
 
         self.assertIn("pilot_policy", settings)
+        self.assertIn("soul", settings)
+        self.assertEqual(settings["soul"]["title"], "Ernie")
+        self.assertIn("careful local operator", settings["soul"]["summary"])
         self.assertTrue(settings["pilot_policy"]["trusted_writes_enabled"])
         self.assertEqual(
             settings["pilot_policy"]["trusted_auto_approve_required_successes"],
@@ -3813,6 +5379,10 @@ class MemoryStoreTests(unittest.TestCase):
             trusted_writes_enabled=True,
             trusted_write_required_successes=4,
             trusted_write_operations=["append_text"],
+            service_sync_suppression_window_seconds={
+                "local_service": 300,
+                "remote_service": 2400,
+            },
         )
         self.assertTrue(enabled["pilot_policy"]["trusted_writes_enabled"])
         self.assertEqual(
@@ -3823,10 +5393,26 @@ class MemoryStoreTests(unittest.TestCase):
             enabled["pilot_policy"]["trusted_auto_approve_required_successes"],
             4,
         )
+        self.assertEqual(
+            enabled["pilot_policy"]["service_sync_suppression_window_seconds"],
+            {
+                "desktop_launcher": 1200,
+                "local_service": 300,
+                "remote_service": 2400,
+            },
+        )
 
         reloaded = LinuxPilotPolicy.load(workspace_root=workspace)
         self.assertEqual(reloaded.trusted_auto_approve_file_operations, {"append_text"})
         self.assertEqual(reloaded.trusted_auto_approve_required_successes, 4)
+        self.assertEqual(
+            reloaded.service_sync_suppression_window_seconds,
+            {
+                "desktop_launcher": 1200,
+                "local_service": 300,
+                "remote_service": 2400,
+            },
+        )
 
     def test_cockpit_service_settings_include_trusted_write_recommendations(self) -> None:
         workspace = self._make_workspace()
@@ -3950,6 +5536,167 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertIn("Local cockpit service restarted.", payload["message"])
         self.assertTrue(payload["settings"]["local_service"]["active"])
 
+    def test_cockpit_service_settings_syncs_recommended_service_tasks(self) -> None:
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+
+        class FakeServiceManager:
+            def settings(self) -> dict[str, object]:
+                return {
+                    "onboarding": {
+                        "actions": [
+                            {
+                                "action": "install_desktop_launcher",
+                                "label": "Install desktop launcher",
+                                "description": "Install the Ernie app-menu entry and launcher.",
+                                "enabled": True,
+                                "success_message": "Desktop launcher installed.",
+                            }
+                        ]
+                    },
+                    "actions": [],
+                }
+
+        service.service_manager = FakeServiceManager()
+        settings = service.settings()
+
+        self.assertIn("service_sync", settings)
+        self.assertEqual(
+            settings["service_sync"]["recommended_actions"],
+            ["install_desktop_launcher"],
+        )
+        synced_task = self.store.find_active_task(
+            "Cockpit setup: Install desktop launcher",
+            area="execution",
+        )
+        self.assertIsNotNone(synced_task)
+        self.assertEqual(
+            synced_task.metadata.get("service_action"),
+            "install_desktop_launcher",
+        )
+
+    def test_cockpit_service_settings_surface_recent_verification_suppression(self) -> None:
+        service = CockpitService(self.store, workspace_root=Path.cwd())
+
+        class FakeServiceManager:
+            def settings(self) -> dict[str, object]:
+                return {
+                    "onboarding": {
+                        "actions": [
+                            {
+                                "action": "install_remote_service",
+                                "label": "Install remote service",
+                                "description": "Install or repair remote access.",
+                                "enabled": True,
+                            }
+                        ]
+                    },
+                    "actions": [],
+                }
+
+        self.store.record_tool_outcome(
+            "service_manager",
+            "Healthy remote verification just completed.",
+            status="success",
+            subject="execution",
+            tags=["executor", "service_inspection", "success"],
+            metadata={
+                "service_inspection": "restart_remote_service",
+                "service_inspection_healthy": True,
+                "resolved_service_sync_titles": ["Cockpit setup: Install remote service"],
+            },
+        )
+
+        service.service_manager = FakeServiceManager()
+        settings = service.settings()
+
+        self.assertIn("service_sync_status", settings)
+        self.assertFalse(settings["service_sync_status"]["due"])
+        self.assertEqual(
+            settings["service_sync_status"]["suppressed_recent_verification_actions"],
+            ["install_remote_service"],
+        )
+        self.assertEqual(
+            settings["service_sync_status"]["suppressed_recent_verification_titles"],
+            ["Cockpit setup: Install remote service"],
+        )
+        self.assertIsNotNone(
+            settings["service_sync_status"]["suppressed_recent_verification_updated_at"]
+        )
+        self.assertGreaterEqual(
+            settings["service_sync_status"]["suppressed_recent_verification_age_seconds"],
+            0,
+        )
+        self.assertGreater(
+            settings["service_sync_status"]["suppressed_recent_verification_expires_in_seconds"],
+            0,
+        )
+
+    def test_cockpit_service_settings_respect_custom_service_sync_suppression_windows(self) -> None:
+        workspace = self._make_workspace()
+        service = CockpitService(self.store, workspace_root=workspace)
+
+        class FakeServiceManager:
+            def settings(self) -> dict[str, object]:
+                return {
+                    "onboarding": {
+                        "actions": [
+                            {
+                                "action": "install_remote_service",
+                                "label": "Install remote service",
+                                "description": "Install or repair remote access.",
+                                "enabled": True,
+                            }
+                        ]
+                    },
+                    "actions": [],
+                }
+
+        verification = self.store.record_tool_outcome(
+            "service_manager",
+            "Healthy remote verification just completed.",
+            status="success",
+            subject="execution",
+            tags=["executor", "service_inspection", "success"],
+            metadata={
+                "service_inspection": "restart_remote_service",
+                "service_inspection_healthy": True,
+                "resolved_service_sync_titles": ["Cockpit setup: Install remote service"],
+            },
+        )
+        backdated = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+        self.store.connection.execute(
+            "update memories set updated_at = ? where id = ?",
+            (backdated, verification.id),
+        )
+        self.store.connection.commit()
+
+        service.service_manager = FakeServiceManager()
+        default_status = service._planner().service_sync_status(
+            service.service_manager.settings()
+        )
+        self.assertFalse(default_status["due"])
+
+        updated = service.update_pilot_policy(
+            service_sync_suppression_window_seconds={"remote_service": 300}
+        )
+        self.assertEqual(
+            updated["pilot_policy"]["service_sync_suppression_window_seconds"]["remote_service"],
+            300,
+        )
+
+        tightened_status = service._planner().service_sync_status(
+            service.service_manager.settings()
+        )
+        self.assertTrue(tightened_status["due"])
+        self.assertEqual(
+            tightened_status["recommended_actions"],
+            ["install_remote_service"],
+        )
+        self.assertEqual(
+            tightened_status["suppressed_recent_verification_actions"],
+            [],
+        )
+
     def test_build_parser_includes_serve_command(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["serve", "--host", "127.0.0.1", "--port", "9001"])
@@ -3969,6 +5716,37 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(args.command, "serve")
         self.assertTrue(args.remote)
         self.assertEqual(args.display_host, "100.1.2.3")
+
+    def test_build_parser_accepts_task_retry_options(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "task",
+                "Retry task",
+                "--command",
+                "python -m memory_agent.cli --help",
+                "--retry-limit",
+                "2",
+                "--retry-cooldown-minutes",
+                "15",
+            ]
+        )
+        self.assertEqual(args.command, "task")
+        self.assertEqual(args.retry_limit, 2)
+        self.assertEqual(args.retry_cooldown_minutes, 15)
+
+    def test_build_parser_accepts_task_service_action(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "task",
+                "Restart cockpit",
+                "--service-action",
+                "restart_local_service",
+            ]
+        )
+        self.assertEqual(args.command, "task")
+        self.assertEqual(args.service_action, "restart_local_service")
 
     def test_resolve_serve_config_generates_remote_token_and_access_url(self) -> None:
         args = Namespace(
