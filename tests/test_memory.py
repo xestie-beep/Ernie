@@ -4017,6 +4017,19 @@ class MemoryStoreTests(unittest.TestCase):
             "def greet() -> str:\n    return 'hello'\n",
         )
 
+    def test_patch_runner_default_validation_commands_target_explicit_test_modules(self) -> None:
+        runner = WorkspacePatchRunner(
+            self.store,
+            workspace_root=Path.cwd(),
+        )
+
+        commands = runner._default_validation_commands(Path.cwd())
+
+        self.assertEqual(len(commands), 1)
+        self.assertIn("python3 -m unittest -v", commands[0])
+        self.assertIn("tests.test_memory", commands[0])
+        self.assertNotIn("discover -s tests -v", commands[0])
+
     def test_improvement_engine_runs_patch_candidate_and_completes_task(self) -> None:
         self._record_green_baseline()
         workspace = self._make_workspace()
@@ -4831,6 +4844,7 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(approved["request_origin"], "prompt_workshop")
         self.assertEqual(approved["prompt_source"], "draft")
         self.assertIsNotNone(approved["execution_result"])
+        self.assertEqual(approved["execution_result"]["status"], "success")
         latest_activity = self.store.get_recent_tool_outcomes(limit=1)[0]
         self.assertEqual(latest_activity.metadata.get("tool_name"), "prompt-pilot-execution")
         self.assertEqual(latest_activity.metadata.get("prompt_source"), "draft")
@@ -4839,14 +4853,14 @@ class MemoryStoreTests(unittest.TestCase):
             latest_activity.metadata.get("execution_status"),
             approved["execution_result"]["status"],
         )
-        self.assertTrue(
-            str(latest_activity.metadata.get("rejection_reason") or "").startswith("validation_failed:")
-        )
+        self.assertEqual(latest_activity.metadata.get("patch_status"), "applied")
+        self.assertEqual(str(latest_activity.metadata.get("rejection_reason") or ""), "")
         self.assertEqual(
             latest_activity.metadata.get("selected_action_title"),
             approved["selected_action"]["title"],
         )
         self.assertIn("Prompt Workshop draft", latest_activity.metadata.get("outcome") or "")
+        self.assertEqual(target.read_text(encoding="utf-8"), "alpha\ngamma\n")
 
     def test_cockpit_html_includes_operator_tutorial_copy(self) -> None:
         self.assertIn("Prepare = preflight", COCKPIT_HTML)

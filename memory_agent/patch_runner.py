@@ -390,7 +390,7 @@ class WorkspacePatchRunner:
         commands = (
             list(validation_commands)
             if validation_commands is not None
-            else self._default_validation_commands()
+            else self._default_validation_commands(temp_workspace)
         )
         if status == "accepted":
             for command in commands:
@@ -404,7 +404,7 @@ class WorkspacePatchRunner:
 
         if status == "accepted":
             evaluation_validation, candidate_evaluation = self._run_candidate_evaluation(
-                shell_adapter=shell_adapter,
+                temp_workspace=temp_workspace,
                 suite_name=selected_suite,
             )
             validations.append(evaluation_validation)
@@ -545,7 +545,7 @@ class WorkspacePatchRunner:
         commands = (
             list(validation_commands)
             if validation_commands is not None
-            else self._default_validation_commands()
+            else self._default_validation_commands(temp_workspace)
         )
         for command in commands:
             shell_result = shell_adapter.execute(command)
@@ -558,7 +558,7 @@ class WorkspacePatchRunner:
 
         if status == "accepted":
             evaluation_validation, candidate_evaluation = self._run_candidate_evaluation(
-                shell_adapter=shell_adapter,
+                temp_workspace=temp_workspace,
                 suite_name=selected_suite,
             )
             validations.append(evaluation_validation)
@@ -714,18 +714,26 @@ class WorkspacePatchRunner:
     def _run_candidate_evaluation(
         self,
         *,
-        shell_adapter: GuardedShellAdapter,
+        temp_workspace: Path,
         suite_name: str,
     ) -> tuple[PatchValidationResult, dict[str, Any] | None]:
         failures: list[str] = []
         last_shell_result: ShellExecutionResult | None = None
+        evaluation_cwd = Path(__file__).resolve().parents[1]
+        candidate_db = temp_workspace / ".agent" / "patch_candidate.sqlite3"
 
         for python_command in available_python_commands():
-            command = (
-                f"{python_command} -m memory_agent.cli "
-                "--db .agent/patch_candidate.sqlite3 evaluate --json"
-            )
-            shell_result = shell_adapter.execute(command)
+            argv = [
+                python_command,
+                "-m",
+                "memory_agent.cli",
+                "--db",
+                str(candidate_db),
+                "evaluate",
+                "--json",
+            ]
+            command = " ".join(argv)
+            shell_result = self._run_process(argv, cwd=evaluation_cwd)
             last_shell_result = shell_result
             if shell_result.status != "success":
                 failures.append(
@@ -756,7 +764,7 @@ class WorkspacePatchRunner:
 
         command = (
             f"{preferred_python_command()} -m memory_agent.cli "
-            "--db .agent/patch_candidate.sqlite3 evaluate --json"
+            f"--db {candidate_db} evaluate --json"
         )
         validation = PatchValidationResult(
             kind="evaluation",
@@ -1373,12 +1381,30 @@ class WorkspacePatchRunner:
             return stripped
         return stripped[: self.output_char_limit - 3].rstrip() + "..."
 
-    def _default_validation_commands(self) -> list[str]:
+    def _default_validation_commands(self, workspace_root: Path | None = None) -> list[str]:
         python_command = self._default_python_command()
-        return [f"{python_command} -m unittest discover -s tests -v"]
+        root = (workspace_root or self.workspace_root).resolve()
+        test_modules = self._default_unittest_modules(root)
+        if test_modules:
+            return [f"{python_command} -m unittest -v {' '.join(test_modules)}"]
+        return []
 
     def _default_python_command(self) -> str:
         return preferred_python_command()
+
+    def _default_unittest_modules(self, workspace_root: Path) -> list[str]:
+        tests_root = workspace_root / "tests"
+        if not tests_root.exists() or not tests_root.is_dir():
+            return []
+        modules: list[str] = []
+        for path in sorted(tests_root.rglob("test*.py")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(workspace_root)
+            module = ".".join(relative.with_suffix("").parts)
+            if module and module not in modules:
+                modules.append(module)
+        return modules
 
     def _slugify(self, text: str) -> str:
         lowered = "".join(
